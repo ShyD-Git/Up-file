@@ -24,9 +24,9 @@ jobs:
           #import <AudioToolbox/AudioToolbox.h>
 
           #define MWRGB(r,g,b,a) [UIColor colorWithRed:(r)/255.0 green:(g)/255.0 blue:(b)/255.0 alpha:(a)]
-          #define MW_PURPLE MWRGB(150,108,225,1)
-          #define MW_DEEP   MWRGB(70,55,130,1)
-          #define MW_TEXT   MWRGB(35,30,60,1)
+          #define MW_PURPLE MWRGB(48,170,240,1)
+          #define MW_DEEP   MWRGB(10,72,112,1)
+          #define MW_TEXT   MWRGB(12,34,56,1)
 
           static NSString *const kEnabled  = @"MW_enabled";
           static NSString *const kHaptic   = @"MW_haptic";
@@ -90,6 +90,60 @@ jobs:
                   if (l > mx) mx = l;
               }
               return (mx - mn) < 3;
+          }
+
+          static NSData *MWThumb(UIImage *img) {
+              CGImageRef cg = img.CGImage;
+              if (!cg) return nil;
+              const int N = 48;
+              NSMutableData *d = [NSMutableData dataWithLength:N * N];
+              CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
+              CGContextRef c = CGBitmapContextCreate(d.mutableBytes, N, N, 8, N, cs, kCGImageAlphaNone);
+              CGContextSetInterpolationQuality(c, kCGInterpolationMedium);
+              CGContextDrawImage(c, CGRectMake(0, 0, N, N), cg);
+              CGContextRelease(c);
+              CGColorSpaceRelease(cs);
+              return d;
+          }
+
+          static NSArray<NSString *> *MWOCRRun(CGImageRef cg, int mode, NSString **info) {
+              NSMutableArray<NSString *> *lines = [NSMutableArray array];
+              @try {
+                  VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:nil];
+                  BOOL fast = (mode == 2 || mode == 4);
+                  req.recognitionLevel = fast ? VNRequestTextRecognitionLevelFast : VNRequestTextRecognitionLevelAccurate;
+                  if (mode == 3 || mode == 4) req.revision = 1;
+                  if (mode == 0) {
+                      req.usesLanguageCorrection = YES;
+                      NSError *e = nil;
+                      NSArray *sup = [req supportedRecognitionLanguagesAndReturnError:&e];
+                      NSMutableArray *langs = [NSMutableArray array];
+                      for (NSString *l in @[@"vi-VT", @"vi-VN", @"en-US"]) {
+                          if ([sup containsObject:l]) [langs addObject:l];
+                      }
+                      if (langs.count) req.recognitionLanguages = langs;
+                  } else {
+                      req.usesLanguageCorrection = NO;
+                  }
+                  VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:cg options:@{}];
+                  NSError *err = nil;
+                  BOOL ok = [h performRequests:@[req] error:&err];
+                  NSArray *obs = [req.results sortedArrayUsingComparator:^NSComparisonResult(VNRecognizedTextObservation *a, VNRecognizedTextObservation *b) {
+                      CGFloat ya = a.boundingBox.origin.y, yb = b.boundingBox.origin.y;
+                      if (ya > yb) return NSOrderedAscending;
+                      if (ya < yb) return NSOrderedDescending;
+                      return NSOrderedSame;
+                  }];
+                  for (VNRecognizedTextObservation *o in obs) {
+                      NSString *t = [o topCandidates:1].firstObject.string;
+                      if (t.length) [lines addObject:t];
+                  }
+                  NSString *st = ok ? @"ok" : [NSString stringWithFormat:@"lỗi: %@", err.localizedDescription ?: @"không rõ"];
+                  if (info) *info = [NSString stringWithFormat:@"mode%d %@, %lu dòng", mode, st, (unsigned long)lines.count];
+              } @catch (NSException *ex) {
+                  if (info) *info = [NSString stringWithFormat:@"mode%d exception: %@", mode, ex.reason ?: ex.name];
+              }
+              return lines;
           }
 
           #pragma mark - Passthrough window
@@ -219,6 +273,12 @@ jobs:
           @property (nonatomic, strong) AVPictureInPictureController *pipController;
           @property (nonatomic, copy) NSString *pipStatus;
           @property (nonatomic) int setupTries;
+          @property (nonatomic, copy) NSString *ocrInfo;
+          @property (nonatomic) NSInteger ocrMode;
+          @property (nonatomic, strong) NSData *prevThumb;
+          @property (nonatomic) double imgDiff;
+          @property (nonatomic, strong) NSDate *lastChange;
+          @property (nonatomic) BOOL pendingDiff;
           @end
 
           @implementation MWManager
@@ -234,6 +294,8 @@ jobs:
                   m.latestLines = @[];
                   m.captureInfo = @"chưa quét";
                   m.pipStatus = @"chưa bật";
+                  m.ocrInfo = @"chưa chạy";
+                  m.ocrMode = -1;
                   m.ocrQueue = dispatch_queue_create("mw.ocr", DISPATCH_QUEUE_SERIAL);
               });
               return m;
@@ -311,6 +373,8 @@ jobs:
               self.newCount = 0;
               self.scanCount = 0;
               self.lastNewDate = nil;
+              self.prevThumb = nil;
+              self.pendingDiff = NO;
               self.startTime = [NSDate date];
           }
 
@@ -335,7 +399,8 @@ jobs:
               return [rd imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
                   CGContextTranslateCTM(ctx.CGContext, -r.origin.x, -r.origin.y);
                   if (mode == 0) {
-                      [tw drawViewHierarchyInRect:tw.bounds afterScreenUpdates:NO];
+                      BOOL inactive = (UIApplication.sharedApplication.applicationState != UIApplicationStateActive);
+                      [tw drawViewHierarchyInRect:tw.bounds afterScreenUpdates:inactive];
                   } else {
                       [tw.layer renderInContext:ctx.CGContext];
                   }
@@ -367,6 +432,15 @@ jobs:
               UIImage *img = [self captureRegion:r];
               if (!img) return;
               self.lastImage = img;
+              NSData *th = MWThumb(img);
+              if (th && self.prevThumb && th.length == self.prevThumb.length) {
+                  const uint8_t *a = th.bytes, *b = self.prevThumb.bytes;
+                  double sum = 0;
+                  for (NSUInteger i = 0; i < th.length; i++) sum += abs((int)a[i] - (int)b[i]);
+                  self.imgDiff = sum / th.length;
+                  if (self.imgDiff > 2.5) { self.lastChange = [NSDate date]; self.pendingDiff = YES; }
+              }
+              self.prevThumb = th;
               [self runOCR:img];
           }
 
@@ -376,34 +450,24 @@ jobs:
               if (!cg) return;
               self.ocrBusy = YES;
               CGImageRetain(cg);
+              NSInteger cached = self.ocrMode;
               dispatch_async(self.ocrQueue, ^{
-                  VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:nil];
-                  req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
-                  req.usesLanguageCorrection = YES;
-                  NSError *e = nil;
-                  NSArray *sup = [req supportedRecognitionLanguagesAndReturnError:&e];
-                  NSMutableArray *langs = [NSMutableArray array];
-                  for (NSString *l in @[@"vi-VT", @"vi-VN", @"en-US"]) {
-                      if ([sup containsObject:l]) [langs addObject:l];
+                  NSArray *order = (cached >= 0) ? @[@(cached)] : @[@0, @1, @2, @3, @4];
+                  NSArray<NSString *> *best = @[];
+                  NSInteger okMode = -1;
+                  NSMutableArray *infos = [NSMutableArray array];
+                  for (NSNumber *m in order) {
+                      NSString *inf = nil;
+                      NSArray<NSString *> *ls = MWOCRRun(cg, m.intValue, &inf);
+                      if (inf) [infos addObject:inf];
+                      if (ls.count) { best = ls; okMode = m.integerValue; break; }
                   }
-                  if (langs.count) req.recognitionLanguages = langs;
-                  VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:cg options:@{}];
-                  NSError *err = nil;
-                  [h performRequests:@[req] error:&err];
                   CGImageRelease(cg);
-                  NSArray *obs = [req.results sortedArrayUsingComparator:^NSComparisonResult(VNRecognizedTextObservation *a, VNRecognizedTextObservation *b) {
-                      CGFloat ya = a.boundingBox.origin.y, yb = b.boundingBox.origin.y;
-                      if (ya > yb) return NSOrderedAscending;
-                      if (ya < yb) return NSOrderedDescending;
-                      return NSOrderedSame;
-                  }];
-                  NSMutableArray<NSString *> *lines = [NSMutableArray array];
-                  for (VNRecognizedTextObservation *o in obs) {
-                      NSString *s = [o topCandidates:1].firstObject.string;
-                      if (s.length) [lines addObject:s];
-                  }
+                  NSString *info = (okMode >= 0) ? infos.lastObject : [infos componentsJoinedByString:@" | "];
                   dispatch_async(dispatch_get_main_queue(), ^{
-                      [self processLines:lines];
+                      self.ocrInfo = info ?: @"?";
+                      if (okMode >= 0) self.ocrMode = okMode;
+                      [self processLines:best];
                   });
               });
           }
@@ -438,6 +502,10 @@ jobs:
                   }
               }
               self.candidates = newCand;
+              if (self.ocrMode < 0 && self.pendingDiff) {
+                  [fresh addObject:@"(vùng chat có thay đổi)"];
+              }
+              self.pendingDiff = NO;
               if (fresh.count) {
                   self.newCount += fresh.count;
                   self.lastNewDate = [NSDate date];
@@ -578,7 +646,7 @@ jobs:
               BOOL fresh = self.lastNewDate && [[NSDate date] timeIntervalSinceDate:self.lastNewDate] < 8;
 
               CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-              CGFloat comps[8] = {0.09, 0.07, 0.20, 1, 0.20, 0.14, 0.40, 1};
+              CGFloat comps[8] = {0.03, 0.10, 0.22, 1, 0.07, 0.32, 0.55, 1};
               CGGradientRef g = CGGradientCreateWithColorComponents(cs, comps, NULL, 2);
               CGContextDrawLinearGradient(c, g, CGPointMake(0, 0), CGPointMake(R.size.width, R.size.height), 0);
               CGGradientRelease(g);
@@ -592,7 +660,7 @@ jobs:
 
               MWDraw(@"MUSEAI • THEO DÕI", CGRectMake(28, 18, 360, 34), [UIFont systemFontOfSize:26 weight:UIFontWeightHeavy], UIColor.whiteColor, NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
               UIBezierPath *pill = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(R.size.width - 190, 18, 162, 34) cornerRadius:17];
-              [(on ? MWRGB(60,190,120,1) : MWRGB(120,110,150,1)) setFill];
+              [(on ? MWRGB(60,190,120,1) : MWRGB(100,125,150,1)) setFill];
               [pill fill];
               MWDraw(on ? @"ĐANG CHẠY" : @"ĐANG TẮT", CGRectMake(R.size.width - 190, 23, 162, 26), [UIFont systemFontOfSize:19 weight:UIFontWeightBold], UIColor.whiteColor, NSTextAlignmentCenter, NSLineBreakByTruncatingTail);
 
@@ -605,7 +673,7 @@ jobs:
                   UIBezierPath *bx = [UIBezierPath bezierPathWithRoundedRect:b cornerRadius:14];
                   [MWRGB(255,255,255,0.09) setFill];
                   [bx fill];
-                  MWDraw(labels[i], CGRectMake(b.origin.x, b.origin.y + 8, b.size.width, 22), [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold], MWRGB(190,170,240,1), NSTextAlignmentCenter, NSLineBreakByTruncatingTail);
+                  MWDraw(labels[i], CGRectMake(b.origin.x, b.origin.y + 8, b.size.width, 22), [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold], MWRGB(165,218,252,1), NSTextAlignmentCenter, NSLineBreakByTruncatingTail);
                   UIColor *vc = (i == 2 && fresh) ? MWRGB(255,170,60,1) : MWRGB(120,235,170,1);
                   MWDraw(vals[i], CGRectMake(b.origin.x, b.origin.y + 32, b.size.width, 40), [UIFont monospacedDigitSystemFontOfSize:34 weight:UIFontWeightBold], vc, NSTextAlignmentCenter, NSLineBreakByTruncatingTail);
               }
@@ -617,7 +685,7 @@ jobs:
 
               CGFloat tx = box.origin.x + 16, tw = box.size.width - 32 - 170, ty = box.origin.y + 12;
               if (self.recentNew.count) {
-                  MWDraw(fresh ? @"● CÓ TIN MỚI" : @"Tin gần nhất", CGRectMake(tx, ty, tw, 26), [UIFont systemFontOfSize:20 weight:UIFontWeightBold], fresh ? MWRGB(255,170,60,1) : MWRGB(190,170,240,1), NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+                  MWDraw(fresh ? @"● CÓ TIN MỚI" : @"Tin gần nhất", CGRectMake(tx, ty, tw, 26), [UIFont systemFontOfSize:20 weight:UIFontWeightBold], fresh ? MWRGB(255,170,60,1) : MWRGB(165,218,252,1), NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
                   NSInteger cnt = self.recentNew.count;
                   NSInteger from = MAX(0, cnt - 4);
                   CGFloat y = ty + 32;
@@ -627,7 +695,7 @@ jobs:
                   }
               } else {
                   NSString *msg = !on ? @"Đang tắt theo dõi" : (CGRectIsNull(MWRegion()) ? @"Chưa chọn vùng chat" : (self.baselineDone ? @"Chưa có tin mới" : @"Đang lấy mốc ban đầu..."));
-                  MWDraw(msg, CGRectMake(tx, ty, tw, 28), [UIFont systemFontOfSize:22 weight:UIFontWeightBold], MWRGB(190,170,240,1), NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+                  MWDraw(msg, CGRectMake(tx, ty, tw, 28), [UIFont systemFontOfSize:22 weight:UIFontWeightBold], MWRGB(165,218,252,1), NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
                   NSInteger cnt = self.latestLines.count;
                   CGFloat y = ty + 36;
                   for (NSInteger i = MAX(0, cnt - 3); i < cnt; i++) {
@@ -722,7 +790,7 @@ jobs:
               card.backgroundColor = MWRGB(255,255,255,0.55);
               card.layer.cornerRadius = 22;
               card.layer.borderWidth = 1;
-              card.layer.borderColor = MWRGB(150,108,225,0.35).CGColor;
+              card.layer.borderColor = MWRGB(48,170,240,0.35).CGColor;
               UIStackView *s = [UIStackView new];
               s.axis = UILayoutConstraintAxisVertical;
               s.translatesAutoresizingMaskIntoConstraints = NO;
@@ -737,7 +805,7 @@ jobs:
                   [s addArrangedSubview:rows[i]];
                   if (i + 1 < rows.count) {
                       UIView *ln = [UIView new];
-                      ln.backgroundColor = MWRGB(150,108,225,0.22);
+                      ln.backgroundColor = MWRGB(48,170,240,0.22);
                       [ln.heightAnchor constraintEqualToConstant:1].active = YES;
                       [s addArrangedSubview:ln];
                   }
@@ -760,7 +828,7 @@ jobs:
               [b setTitle:t forState:UIControlStateNormal];
               b.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
               b.layer.cornerRadius = 14;
-              b.backgroundColor = f ? MW_PURPLE : MWRGB(150,108,225,0.18);
+              b.backgroundColor = f ? MW_PURPLE : MWRGB(48,170,240,0.18);
               [b setTitleColor:(f ? UIColor.whiteColor : MW_DEEP) forState:UIControlStateNormal];
               [b addAction:[UIAction actionWithHandler:^(UIAction *x) { a(); }] forControlEvents:UIControlEventTouchUpInside];
               [b.heightAnchor constraintEqualToConstant:46].active = YES;
@@ -791,12 +859,12 @@ jobs:
               blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
               [self.sheet addSubview:blur];
               UIView *tint = [[UIView alloc] initWithFrame:self.sheet.bounds];
-              tint.backgroundColor = MWRGB(243,238,250,0.65);
+              tint.backgroundColor = MWRGB(234,246,255,0.65);
               tint.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
               [self.sheet addSubview:tint];
 
               UIView *grab = [[UIView alloc] initWithFrame:CGRectMake(sz.width / 2 - 28, 10, 56, 6)];
-              grab.backgroundColor = MWRGB(150,108,225,0.5);
+              grab.backgroundColor = MWRGB(48,170,240,0.5);
               grab.layer.cornerRadius = 3;
               [self.sheet addSubview:grab];
 
@@ -905,12 +973,15 @@ jobs:
               CGRect r = MWRegion();
               NSString *reg = CGRectIsNull(r) ? @"chưa chọn" : [NSString stringWithFormat:@"đã chọn (%.0f%%, %.0f%%, %.0f%%, %.0f%%)", r.origin.x * 100, r.origin.y * 100, r.size.width * 100, r.size.height * 100];
               self.statusLabel.text = [NSString stringWithFormat:
-                  @"Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld • Tin mới: %ld\nDòng chữ đọc được: %lu\nChụp ảnh: %@\nPiP: %@",
+                  @"v1.1 • Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld • Tin mới: %ld\nDòng chữ đọc được: %lu\nOCR: %@\nChụp ảnh: %@\nẢnh đổi: %.1f (lần cuối: %@)\nPiP: %@",
                   MWBool(kEnabled, NO) ? @"đang chạy" : @"tắt",
                   reg,
                   (long)self.scanCount, (long)self.newCount,
                   (unsigned long)self.latestLines.count,
+                  self.ocrInfo,
                   self.captureInfo,
+                  self.imgDiff,
+                  self.lastChange ? [NSString stringWithFormat:@"%.0f giây trước", [[NSDate date] timeIntervalSinceDate:self.lastChange]] : @"chưa có",
                   self.pipStatus];
           }
 
@@ -981,4 +1052,3 @@ jobs:
           git commit -m "build MuseWatch.dylib" || echo "nothing to commit"
           git pull --rebase || true
           git push
-
