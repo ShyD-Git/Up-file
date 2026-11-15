@@ -1,0 +1,12 @@
+4.0K	analysis/00_info.txt
+4.0K	analysis/01_linked_libs.txt
+4.0K	analysis/02_header.txt
+4.0K	analysis/03_segments.txt
+4.0K	analysis/04_exports.txt
+4.0K	analysis/05_strings_count.txt
+ 64K	analysis/10_pip_strings.txt
+4.0K	analysis/11_ui_strings.txt
+4.0K	analysis/20_objc_lines.txt
+  0B	analysis/21_objc_names.txt
+  0B	analysis/22_class_names.txt
+4.0K	analysis/23_symbols_ui_pip.txt

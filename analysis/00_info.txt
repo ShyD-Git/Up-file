@@ -1,0 +1,3 @@
+/tmp/Ziga_AI.dylib: Mach-O 64-bit dynamically linked shared library arm64
+Non-fat file: /tmp/Ziga_AI.dylib is architecture: arm64
+-rw-------  1 runner  wheel  58927475 Nov 15 07:19 /tmp/Ziga_AI.dylib

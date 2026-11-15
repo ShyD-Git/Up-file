@@ -1,0 +1,1 @@
+  714940 /tmp/all_strings.txt
