@@ -1,0 +1,984 @@
+name: Build MuseWatch dylib
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write source
+        run: |
+          cat > MuseWatch.m <<'MW_EOF'
+          #import <UIKit/UIKit.h>
+          #import <AVFoundation/AVFoundation.h>
+          #import <AVKit/AVKit.h>
+          #import <CoreMedia/CoreMedia.h>
+          #import <CoreVideo/CoreVideo.h>
+          #import <Vision/Vision.h>
+          #import <AudioToolbox/AudioToolbox.h>
+
+          #define MWRGB(r,g,b,a) [UIColor colorWithRed:(r)/255.0 green:(g)/255.0 blue:(b)/255.0 alpha:(a)]
+          #define MW_PURPLE MWRGB(150,108,225,1)
+          #define MW_DEEP   MWRGB(70,55,130,1)
+          #define MW_TEXT   MWRGB(35,30,60,1)
+
+          static NSString *const kEnabled  = @"MW_enabled";
+          static NSString *const kHaptic   = @"MW_haptic";
+          static NSString *const kSound    = @"MW_sound";
+          static NSString *const kAutoPiP  = @"MW_autopip";
+          static NSString *const kInterval = @"MW_interval";
+          static NSString *const kRegion   = @"MW_region";
+
+          static BOOL MWBool(NSString *k, BOOL d) {
+              id v = [[NSUserDefaults standardUserDefaults] objectForKey:k];
+              return v ? [v boolValue] : d;
+          }
+          static double MWDouble(NSString *k, double d) {
+              id v = [[NSUserDefaults standardUserDefaults] objectForKey:k];
+              return v ? [v doubleValue] : d;
+          }
+          static void MWSetObj(NSString *k, id v) {
+              [[NSUserDefaults standardUserDefaults] setObject:v forKey:k];
+          }
+          static CGRect MWRegion(void) {
+              NSString *s = [[NSUserDefaults standardUserDefaults] stringForKey:kRegion];
+              if (!s) return CGRectNull;
+              NSArray *p = [s componentsSeparatedByString:@","];
+              if (p.count != 4) return CGRectNull;
+              return CGRectMake([p[0] doubleValue], [p[1] doubleValue], [p[2] doubleValue], [p[3] doubleValue]);
+          }
+          static void MWSetRegion(CGRect r) {
+              MWSetObj(kRegion, [NSString stringWithFormat:@"%.5f,%.5f,%.5f,%.5f", r.origin.x, r.origin.y, r.size.width, r.size.height]);
+          }
+
+          static UILabel *MWLabel(NSString *t, CGFloat sz, UIFontWeight w, UIColor *c) {
+              UILabel *l = [UILabel new];
+              l.text = t;
+              l.font = [UIFont systemFontOfSize:sz weight:w];
+              l.textColor = c;
+              return l;
+          }
+
+          static void MWDraw(NSString *s, CGRect r, UIFont *f, UIColor *c, NSTextAlignment al, NSLineBreakMode lb) {
+              NSMutableParagraphStyle *ps = [NSMutableParagraphStyle new];
+              ps.alignment = al;
+              ps.lineBreakMode = lb;
+              [s drawInRect:r withAttributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: c, NSParagraphStyleAttributeName: ps}];
+          }
+
+          static BOOL MWIsBlank(UIImage *img) {
+              CGImageRef cg = img.CGImage;
+              if (!cg) return YES;
+              const int N = 32;
+              uint8_t buf[32 * 32 * 4];
+              memset(buf, 0, sizeof(buf));
+              CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+              CGContextRef c = CGBitmapContextCreate(buf, N, N, 8, N * 4, cs, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+              CGContextDrawImage(c, CGRectMake(0, 0, N, N), cg);
+              CGContextRelease(c);
+              CGColorSpaceRelease(cs);
+              int mn = 255, mx = 0;
+              for (int i = 0; i < N * N; i++) {
+                  int l = (buf[i * 4] + buf[i * 4 + 1] + buf[i * 4 + 2]) / 3;
+                  if (l < mn) mn = l;
+                  if (l > mx) mx = l;
+              }
+              return (mx - mn) < 3;
+          }
+
+          #pragma mark - Passthrough window
+
+          @interface MWPassWindow : UIWindow
+          @end
+          @implementation MWPassWindow
+          - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+              UIView *v = [super hitTest:p withEvent:e];
+              if (v == self || v == self.rootViewController.view) return nil;
+              return v;
+          }
+          @end
+
+          #pragma mark - Region selection view
+
+          @interface MWSelectionView : UIView
+          @property (nonatomic, copy) void (^onDone)(CGRect normRect);
+          @property (nonatomic, copy) void (^onCancel)(void);
+          @property (nonatomic) CGRect sel;
+          @property (nonatomic, strong) UILabel *hint;
+          @end
+
+          @implementation MWSelectionView
+          - (instancetype)initWithFrame:(CGRect)f {
+              self = [super initWithFrame:f];
+              if (self) {
+                  self.backgroundColor = UIColor.clearColor;
+                  self.opaque = NO;
+                  _sel = CGRectNull;
+                  UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)];
+                  [self addGestureRecognizer:pan];
+
+                  _hint = MWLabel(@"Kéo để khoanh vùng khung chat", 17, UIFontWeightSemibold, UIColor.whiteColor);
+                  _hint.textAlignment = NSTextAlignmentCenter;
+                  _hint.frame = CGRectMake(0, 70, f.size.width, 30);
+                  [self addSubview:_hint];
+
+                  CGFloat y = f.size.height - 110;
+                  UIButton *cancel = [UIButton buttonWithType:UIButtonTypeSystem];
+                  [cancel setTitle:@"Hủy" forState:UIControlStateNormal];
+                  cancel.frame = CGRectMake(f.size.width / 2 - 150, y, 140, 48);
+                  cancel.backgroundColor = MWRGB(255,255,255,0.25);
+                  cancel.layer.cornerRadius = 14;
+                  [cancel setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+                  [cancel addTarget:self action:@selector(cancelTap) forControlEvents:UIControlEventTouchUpInside];
+                  [self addSubview:cancel];
+
+                  UIButton *done = [UIButton buttonWithType:UIButtonTypeSystem];
+                  [done setTitle:@"Xong" forState:UIControlStateNormal];
+                  done.frame = CGRectMake(f.size.width / 2 + 10, y, 140, 48);
+                  done.backgroundColor = MW_PURPLE;
+                  done.layer.cornerRadius = 14;
+                  [done setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+                  done.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+                  [done addTarget:self action:@selector(doneTap) forControlEvents:UIControlEventTouchUpInside];
+                  [self addSubview:done];
+              }
+              return self;
+          }
+          - (void)drawRect:(CGRect)rect {
+              CGContextRef c = UIGraphicsGetCurrentContext();
+              CGContextSetFillColorWithColor(c, MWRGB(0,0,0,0.55).CGColor);
+              CGContextFillRect(c, self.bounds);
+              if (!CGRectIsNull(_sel)) {
+                  CGContextClearRect(c, _sel);
+                  CGContextSetStrokeColorWithColor(c, MW_PURPLE.CGColor);
+                  CGContextSetLineWidth(c, 3);
+                  CGContextStrokeRect(c, _sel);
+              }
+          }
+          - (void)pan:(UIPanGestureRecognizer *)g {
+              CGPoint p = [g locationInView:self];
+              CGPoint t = [g translationInView:self];
+              CGPoint s = CGPointMake(p.x - t.x, p.y - t.y);
+              CGRect r = CGRectMake(MIN(s.x, p.x), MIN(s.y, p.y), fabs(t.x), fabs(t.y));
+              _sel = CGRectIntersection(r, self.bounds);
+              [self setNeedsDisplay];
+          }
+          - (void)cancelTap {
+              if (self.onCancel) self.onCancel();
+          }
+          - (void)doneTap {
+              if (CGRectIsNull(_sel) || _sel.size.width < 40 || _sel.size.height < 40) {
+                  _hint.text = @"Hãy kéo khung đủ lớn rồi bấm Xong";
+                  return;
+              }
+              CGSize b = self.bounds.size;
+              CGRect n = CGRectMake(_sel.origin.x / b.width, _sel.origin.y / b.height, _sel.size.width / b.width, _sel.size.height / b.height);
+              if (self.onDone) self.onDone(n);
+          }
+          @end
+
+          #pragma mark - Manager
+
+          @interface MWManager : NSObject <AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate>
+          + (instancetype)shared;
+          - (void)setupIfPossible;
+          @end
+
+          @interface MWManager ()
+          @property (nonatomic, strong) MWPassWindow *window;
+          @property (nonatomic, strong) UIButton *floatBtn;
+          @property (nonatomic, strong) UIControl *dim;
+          @property (nonatomic, strong) UIView *sheet;
+          @property (nonatomic, strong) UILabel *statusLabel;
+          @property (nonatomic, strong) UILabel *intervalValue;
+          @property (nonatomic, strong) MWSelectionView *selView;
+          @property (nonatomic, strong) NSTimer *scanTimer;
+          @property (nonatomic, strong) NSTimer *pipTimer;
+          @property (nonatomic, strong) NSTimer *uiTimer;
+          @property (nonatomic, strong) NSDate *startTime;
+          @property (nonatomic) NSInteger scanCount;
+          @property (nonatomic) NSInteger newCount;
+          @property (nonatomic, strong) NSDate *lastNewDate;
+          @property (nonatomic, strong) NSArray<NSString *> *latestLines;
+          @property (nonatomic, strong) NSMutableArray<NSString *> *recentNew;
+          @property (nonatomic, strong) NSMutableSet<NSString *> *known;
+          @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *candidates;
+          @property (nonatomic) BOOL baselineDone;
+          @property (nonatomic) BOOL ocrBusy;
+          @property (nonatomic, strong) dispatch_queue_t ocrQueue;
+          @property (nonatomic, strong) UIImage *lastImage;
+          @property (nonatomic, copy) NSString *captureInfo;
+          @property (nonatomic, strong) AVSampleBufferDisplayLayer *displayLayer;
+          @property (nonatomic, strong) UIView *pipHost;
+          @property (nonatomic, strong) AVPictureInPictureController *pipController;
+          @property (nonatomic, copy) NSString *pipStatus;
+          @property (nonatomic) int setupTries;
+          @end
+
+          @implementation MWManager
+
+          + (instancetype)shared {
+              static MWManager *m;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{
+                  m = [MWManager new];
+                  m.recentNew = [NSMutableArray array];
+                  m.known = [NSMutableSet set];
+                  m.candidates = [NSMutableDictionary dictionary];
+                  m.latestLines = @[];
+                  m.captureInfo = @"chưa quét";
+                  m.pipStatus = @"chưa bật";
+                  m.ocrQueue = dispatch_queue_create("mw.ocr", DISPATCH_QUEUE_SERIAL);
+              });
+              return m;
+          }
+
+          #pragma mark Setup
+
+          - (void)setupIfPossible {
+              if (self.window) return;
+              UIWindowScene *scene = nil;
+              for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                  if ([s isKindOfClass:UIWindowScene.class] && s.activationState == UISceneActivationStateForegroundActive) {
+                      scene = (UIWindowScene *)s;
+                      break;
+                  }
+              }
+              if (!scene) {
+                  if (self.setupTries++ < 40) {
+                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                          [self setupIfPossible];
+                      });
+                  }
+                  return;
+              }
+              self.window = [[MWPassWindow alloc] initWithWindowScene:scene];
+              self.window.frame = scene.coordinateSpace.bounds;
+              self.window.windowLevel = UIWindowLevelAlert + 100;
+              self.window.backgroundColor = UIColor.clearColor;
+              UIViewController *vc = [UIViewController new];
+              vc.view.backgroundColor = UIColor.clearColor;
+              self.window.rootViewController = vc;
+              self.window.hidden = NO;
+
+              CGSize sz = self.window.bounds.size;
+              self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+              self.floatBtn.frame = CGRectMake(sz.width - 64, 150, 46, 46);
+              self.floatBtn.backgroundColor = MW_PURPLE;
+              self.floatBtn.layer.cornerRadius = 23;
+              self.floatBtn.layer.shadowColor = UIColor.blackColor.CGColor;
+              self.floatBtn.layer.shadowOpacity = 0.3;
+              self.floatBtn.layer.shadowRadius = 6;
+              self.floatBtn.layer.shadowOffset = CGSizeMake(0, 3);
+              [self.floatBtn setTitle:@"M" forState:UIControlStateNormal];
+              self.floatBtn.titleLabel.font = [UIFont systemFontOfSize:20 weight:UIFontWeightBold];
+              [self.floatBtn addTarget:self action:@selector(toggleSheet) forControlEvents:UIControlEventTouchUpInside];
+              UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragBtn:)];
+              [self.floatBtn addGestureRecognizer:pan];
+              [vc.view addSubview:self.floatBtn];
+
+              self.startTime = [NSDate date];
+              [self restartScanTimer];
+              NSLog(@"[MuseWatch] ready");
+          }
+
+          - (void)dragBtn:(UIPanGestureRecognizer *)g {
+              CGPoint t = [g translationInView:self.window];
+              g.view.center = CGPointMake(g.view.center.x + t.x, g.view.center.y + t.y);
+              [g setTranslation:CGPointZero inView:self.window];
+          }
+
+          - (void)restartScanTimer {
+              [self.scanTimer invalidate];
+              double iv = MWDouble(kInterval, 1.5);
+              __weak MWManager *ws = self;
+              self.scanTimer = [NSTimer scheduledTimerWithTimeInterval:iv repeats:YES block:^(NSTimer *t) {
+                  [ws scanTick];
+              }];
+          }
+
+          - (void)resetTracking {
+              [self.known removeAllObjects];
+              [self.candidates removeAllObjects];
+              [self.recentNew removeAllObjects];
+              self.baselineDone = NO;
+              self.newCount = 0;
+              self.scanCount = 0;
+              self.lastNewDate = nil;
+              self.startTime = [NSDate date];
+          }
+
+          #pragma mark Capture + OCR
+
+          - (UIWindow *)targetWindow {
+              UIWindowScene *scene = self.window.windowScene;
+              UIWindow *best = nil;
+              for (UIWindow *w in scene.windows) {
+                  if (w == self.window || w.hidden) continue;
+                  if (w.windowLevel > UIWindowLevelNormal) continue;
+                  if (!best || w.isKeyWindow) best = w;
+              }
+              return best;
+          }
+
+          - (UIImage *)renderWindow:(UIWindow *)tw rect:(CGRect)r mode:(int)mode {
+              UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat preferredFormat];
+              f.opaque = YES;
+              if (f.scale > 2) f.scale = 2;
+              UIGraphicsImageRenderer *rd = [[UIGraphicsImageRenderer alloc] initWithSize:r.size format:f];
+              return [rd imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+                  CGContextTranslateCTM(ctx.CGContext, -r.origin.x, -r.origin.y);
+                  if (mode == 0) {
+                      [tw drawViewHierarchyInRect:tw.bounds afterScreenUpdates:NO];
+                  } else {
+                      [tw.layer renderInContext:ctx.CGContext];
+                  }
+              }];
+          }
+
+          - (UIImage *)captureRegion:(CGRect)n {
+              UIWindow *tw = [self targetWindow];
+              if (!tw) { self.captureInfo = @"không tìm thấy cửa sổ app"; return nil; }
+              CGRect b = tw.bounds;
+              CGRect r = CGRectMake(n.origin.x * b.size.width, n.origin.y * b.size.height, n.size.width * b.size.width, n.size.height * b.size.height);
+              r = CGRectIntersection(r, b);
+              if (CGRectIsNull(r) || r.size.width < 20 || r.size.height < 20) { self.captureInfo = @"vùng chọn không hợp lệ"; return nil; }
+              UIImage *img = [self renderWindow:tw rect:r mode:0];
+              NSString *m = @"drawViewHierarchy";
+              if (MWIsBlank(img)) {
+                  UIImage *img2 = [self renderWindow:tw rect:r mode:1];
+                  if (img2 && !MWIsBlank(img2)) { img = img2; m = @"renderInContext"; }
+                  else { m = @"ẢNH TRỐNG/ĐEN (cả 2 cách đều không chụp được)"; }
+              }
+              self.captureInfo = m;
+              return img;
+          }
+
+          - (void)scanTick {
+              if (!MWBool(kEnabled, NO)) return;
+              CGRect r = MWRegion();
+              if (CGRectIsNull(r)) return;
+              UIImage *img = [self captureRegion:r];
+              if (!img) return;
+              self.lastImage = img;
+              [self runOCR:img];
+          }
+
+          - (void)runOCR:(UIImage *)img {
+              if (self.ocrBusy) return;
+              CGImageRef cg = img.CGImage;
+              if (!cg) return;
+              self.ocrBusy = YES;
+              CGImageRetain(cg);
+              dispatch_async(self.ocrQueue, ^{
+                  VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:nil];
+                  req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+                  req.usesLanguageCorrection = YES;
+                  NSError *e = nil;
+                  NSArray *sup = [req supportedRecognitionLanguagesAndReturnError:&e];
+                  NSMutableArray *langs = [NSMutableArray array];
+                  for (NSString *l in @[@"vi-VT", @"vi-VN", @"en-US"]) {
+                      if ([sup containsObject:l]) [langs addObject:l];
+                  }
+                  if (langs.count) req.recognitionLanguages = langs;
+                  VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:cg options:@{}];
+                  NSError *err = nil;
+                  [h performRequests:@[req] error:&err];
+                  CGImageRelease(cg);
+                  NSArray *obs = [req.results sortedArrayUsingComparator:^NSComparisonResult(VNRecognizedTextObservation *a, VNRecognizedTextObservation *b) {
+                      CGFloat ya = a.boundingBox.origin.y, yb = b.boundingBox.origin.y;
+                      if (ya > yb) return NSOrderedAscending;
+                      if (ya < yb) return NSOrderedDescending;
+                      return NSOrderedSame;
+                  }];
+                  NSMutableArray<NSString *> *lines = [NSMutableArray array];
+                  for (VNRecognizedTextObservation *o in obs) {
+                      NSString *s = [o topCandidates:1].firstObject.string;
+                      if (s.length) [lines addObject:s];
+                  }
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      [self processLines:lines];
+                  });
+              });
+          }
+
+          static NSString *MWNorm(NSString *s) {
+              return [[s lowercaseString] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+          }
+
+          - (void)processLines:(NSArray<NSString *> *)lines {
+              self.ocrBusy = NO;
+              self.scanCount++;
+              self.latestLines = lines;
+              if (!self.baselineDone) {
+                  for (NSString *l in lines) {
+                      NSString *n = MWNorm(l);
+                      if (n.length >= 3) [self.known addObject:n];
+                  }
+                  self.baselineDone = YES;
+                  return;
+              }
+              NSMutableDictionary *newCand = [NSMutableDictionary dictionary];
+              NSMutableArray *fresh = [NSMutableArray array];
+              for (NSString *l in lines) {
+                  NSString *n = MWNorm(l);
+                  if (n.length < 3 || [self.known containsObject:n]) continue;
+                  NSInteger c = [self.candidates[n] integerValue] + 1;
+                  if (c >= 2) {
+                      [self.known addObject:n];
+                      [fresh addObject:l];
+                  } else {
+                      newCand[n] = @(c);
+                  }
+              }
+              self.candidates = newCand;
+              if (fresh.count) {
+                  self.newCount += fresh.count;
+                  self.lastNewDate = [NSDate date];
+                  [self.recentNew addObjectsFromArray:fresh];
+                  while (self.recentNew.count > 6) [self.recentNew removeObjectAtIndex:0];
+                  if (MWBool(kHaptic, YES)) {
+                      UINotificationFeedbackGenerator *g = [UINotificationFeedbackGenerator new];
+                      [g notificationOccurred:UINotificationFeedbackTypeSuccess];
+                  }
+                  if (MWBool(kSound, NO)) AudioServicesPlaySystemSound(1007);
+              }
+          }
+
+          #pragma mark PiP
+
+          - (void)setupPiP {
+              if (self.pipController) return;
+              if (![AVPictureInPictureController isPictureInPictureSupported]) {
+                  self.pipStatus = @"thiết bị không hỗ trợ PiP";
+                  return;
+              }
+              AVAudioSession *s = [AVAudioSession sharedInstance];
+              [s setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeMoviePlayback options:AVAudioSessionCategoryOptionMixWithOthers error:nil];
+              [s setActive:YES error:nil];
+
+              self.pipHost = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 192, 108)];
+              self.pipHost.alpha = 0.01;
+              self.pipHost.userInteractionEnabled = NO;
+              self.displayLayer = [AVSampleBufferDisplayLayer layer];
+              self.displayLayer.frame = self.pipHost.bounds;
+              self.displayLayer.videoGravity = AVLayerVideoGravityResizeAspect;
+              [self.pipHost.layer addSublayer:self.displayLayer];
+              [self.window.rootViewController.view insertSubview:self.pipHost atIndex:0];
+
+              CMTimebaseRef tb = NULL;
+              CMTimebaseCreateWithSourceClock(kCFAllocatorDefault, CMClockGetHostTimeClock(), &tb);
+              if (tb) {
+                  CMTimebaseSetRate(tb, 1.0);
+                  CMTimebaseSetTime(tb, CMClockGetTime(CMClockGetHostTimeClock()));
+                  self.displayLayer.controlTimebase = tb;
+                  CFRelease(tb);
+              }
+
+              AVPictureInPictureControllerContentSource *src = [[AVPictureInPictureControllerContentSource alloc] initWithSampleBufferDisplayLayer:self.displayLayer playbackDelegate:self];
+              self.pipController = [[AVPictureInPictureController alloc] initWithContentSource:src];
+              self.pipController.delegate = self;
+              self.pipController.canStartPictureInPictureAutomaticallyFromInline = MWBool(kAutoPiP, YES);
+              self.pipStatus = @"sẵn sàng";
+
+              [self enqueueFrame];
+              [self.pipTimer invalidate];
+              __weak MWManager *ws = self;
+              self.pipTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+                  [ws enqueueFrame];
+              }];
+          }
+
+          - (void)startPiP {
+              [self setupPiP];
+              [self startPiPAttempt:0];
+          }
+
+          - (void)startPiPAttempt:(int)n {
+              if (!self.pipController) return;
+              if (self.pipController.isPictureInPictureActive) return;
+              if (self.pipController.isPictureInPicturePossible) {
+                  [self.pipController startPictureInPicture];
+                  return;
+              }
+              if (n >= 8) { self.pipStatus = @"PiP chưa sẵn sàng, bấm lại sau"; return; }
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                  [self startPiPAttempt:n + 1];
+              });
+          }
+
+          - (void)stopPiP {
+              if (self.pipController.isPictureInPictureActive) [self.pipController stopPictureInPicture];
+          }
+
+          - (CVPixelBufferRef)newPixelBuffer {
+              const size_t W = 640, H = 360;
+              NSDictionary *attrs = @{
+                  (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+                  (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+                  (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+              };
+              CVPixelBufferRef pb = NULL;
+              if (CVPixelBufferCreate(kCFAllocatorDefault, W, H, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess) return NULL;
+              CVPixelBufferLockBaseAddress(pb, 0);
+              void *base = CVPixelBufferGetBaseAddress(pb);
+              CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+              CGContextRef ctx = CGBitmapContextCreate(base, W, H, 8, CVPixelBufferGetBytesPerRow(pb), cs, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+              CGContextTranslateCTM(ctx, 0, H);
+              CGContextScaleCTM(ctx, 1, -1);
+              UIGraphicsPushContext(ctx);
+              [self drawCard:CGRectMake(0, 0, W, H)];
+              UIGraphicsPopContext();
+              CGContextRelease(ctx);
+              CGColorSpaceRelease(cs);
+              CVPixelBufferUnlockBaseAddress(pb, 0);
+              return pb;
+          }
+
+          - (void)enqueueFrame {
+              if (!self.displayLayer) return;
+              CVPixelBufferRef pb = [self newPixelBuffer];
+              if (!pb) return;
+              CMVideoFormatDescriptionRef fd = NULL;
+              CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fd);
+              CMSampleTimingInfo t;
+              t.duration = CMTimeMake(1, 2);
+              t.presentationTimeStamp = CMClockGetTime(CMClockGetHostTimeClock());
+              t.decodeTimeStamp = kCMTimeInvalid;
+              CMSampleBufferRef sb = NULL;
+              CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pb, fd, &t, &sb);
+              if (sb) {
+                  CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sb, YES);
+                  if (att && CFArrayGetCount(att) > 0) {
+                      CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(att, 0);
+                      CFDictionarySetValue(d, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+                  }
+                  if (self.displayLayer.status == AVQueuedSampleBufferRenderingStatusFailed) [self.displayLayer flush];
+                  [self.displayLayer enqueueSampleBuffer:sb];
+                  CFRelease(sb);
+              }
+              if (fd) CFRelease(fd);
+              CVPixelBufferRelease(pb);
+          }
+
+          static NSString *MWTime(NSTimeInterval s) {
+              int t = (int)s;
+              return [NSString stringWithFormat:@"%02d:%02d:%02d", t / 3600, (t / 60) % 60, t % 60];
+          }
+
+          - (void)drawCard:(CGRect)R {
+              CGContextRef c = UIGraphicsGetCurrentContext();
+              BOOL on = MWBool(kEnabled, NO);
+              BOOL fresh = self.lastNewDate && [[NSDate date] timeIntervalSinceDate:self.lastNewDate] < 8;
+
+              CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+              CGFloat comps[8] = {0.09, 0.07, 0.20, 1, 0.20, 0.14, 0.40, 1};
+              CGGradientRef g = CGGradientCreateWithColorComponents(cs, comps, NULL, 2);
+              CGContextDrawLinearGradient(c, g, CGPointMake(0, 0), CGPointMake(R.size.width, R.size.height), 0);
+              CGGradientRelease(g);
+              CGColorSpaceRelease(cs);
+
+              UIColor *accent = fresh ? MWRGB(255,170,60,1) : MW_PURPLE;
+              UIBezierPath *bp = [UIBezierPath bezierPathWithRoundedRect:CGRectInset(R, 4, 4) cornerRadius:22];
+              bp.lineWidth = fresh ? 7 : 3;
+              [accent setStroke];
+              [bp stroke];
+
+              MWDraw(@"MUSEAI • THEO DÕI", CGRectMake(28, 18, 360, 34), [UIFont systemFontOfSize:26 weight:UIFontWeightHeavy], UIColor.whiteColor, NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+              UIBezierPath *pill = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(R.size.width - 190, 18, 162, 34) cornerRadius:17];
+              [(on ? MWRGB(60,190,120,1) : MWRGB(120,110,150,1)) setFill];
+              [pill fill];
+              MWDraw(on ? @"ĐANG CHẠY" : @"ĐANG TẮT", CGRectMake(R.size.width - 190, 23, 162, 26), [UIFont systemFontOfSize:19 weight:UIFontWeightBold], UIColor.whiteColor, NSTextAlignmentCenter, NSLineBreakByTruncatingTail);
+
+              CGFloat bw = (R.size.width - 56 - 24) / 3.0;
+              NSArray *labels = @[@"THỜI GIAN", @"ĐÃ QUÉT", @"TIN MỚI"];
+              NSTimeInterval el = (on && self.startTime) ? [[NSDate date] timeIntervalSinceDate:self.startTime] : 0;
+              NSArray *vals = @[MWTime(el), [NSString stringWithFormat:@"%ld", (long)self.scanCount], [NSString stringWithFormat:@"%ld", (long)self.newCount]];
+              for (int i = 0; i < 3; i++) {
+                  CGRect b = CGRectMake(28 + i * (bw + 12), 68, bw, 78);
+                  UIBezierPath *bx = [UIBezierPath bezierPathWithRoundedRect:b cornerRadius:14];
+                  [MWRGB(255,255,255,0.09) setFill];
+                  [bx fill];
+                  MWDraw(labels[i], CGRectMake(b.origin.x, b.origin.y + 8, b.size.width, 22), [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold], MWRGB(190,170,240,1), NSTextAlignmentCenter, NSLineBreakByTruncatingTail);
+                  UIColor *vc = (i == 2 && fresh) ? MWRGB(255,170,60,1) : MWRGB(120,235,170,1);
+                  MWDraw(vals[i], CGRectMake(b.origin.x, b.origin.y + 32, b.size.width, 40), [UIFont monospacedDigitSystemFontOfSize:34 weight:UIFontWeightBold], vc, NSTextAlignmentCenter, NSLineBreakByTruncatingTail);
+              }
+
+              CGRect box = CGRectMake(28, 160, R.size.width - 56, R.size.height - 160 - 20);
+              UIBezierPath *lb = [UIBezierPath bezierPathWithRoundedRect:box cornerRadius:14];
+              [MWRGB(255,255,255,0.07) setFill];
+              [lb fill];
+
+              CGFloat tx = box.origin.x + 16, tw = box.size.width - 32 - 170, ty = box.origin.y + 12;
+              if (self.recentNew.count) {
+                  MWDraw(fresh ? @"● CÓ TIN MỚI" : @"Tin gần nhất", CGRectMake(tx, ty, tw, 26), [UIFont systemFontOfSize:20 weight:UIFontWeightBold], fresh ? MWRGB(255,170,60,1) : MWRGB(190,170,240,1), NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+                  NSInteger cnt = self.recentNew.count;
+                  NSInteger from = MAX(0, cnt - 4);
+                  CGFloat y = ty + 32;
+                  for (NSInteger i = cnt - 1; i >= from; i--) {
+                      MWDraw(self.recentNew[i], CGRectMake(tx, y, tw, 28), [UIFont systemFontOfSize:22 weight:UIFontWeightMedium], UIColor.whiteColor, NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+                      y += 30;
+                  }
+              } else {
+                  NSString *msg = !on ? @"Đang tắt theo dõi" : (CGRectIsNull(MWRegion()) ? @"Chưa chọn vùng chat" : (self.baselineDone ? @"Chưa có tin mới" : @"Đang lấy mốc ban đầu..."));
+                  MWDraw(msg, CGRectMake(tx, ty, tw, 28), [UIFont systemFontOfSize:22 weight:UIFontWeightBold], MWRGB(190,170,240,1), NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+                  NSInteger cnt = self.latestLines.count;
+                  CGFloat y = ty + 36;
+                  for (NSInteger i = MAX(0, cnt - 3); i < cnt; i++) {
+                      MWDraw(self.latestLines[i], CGRectMake(tx, y, tw, 26), [UIFont systemFontOfSize:20] , MWRGB(255,255,255,0.65), NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+                      y += 28;
+                  }
+              }
+
+              if (self.lastImage) {
+                  CGRect slot = CGRectMake(box.origin.x + box.size.width - 154, box.origin.y + 12, 142, box.size.height - 24);
+                  CGSize is = self.lastImage.size;
+                  if (is.width > 0 && is.height > 0) {
+                      CGFloat sc = MIN(slot.size.width / is.width, slot.size.height / is.height);
+                      CGSize fs = CGSizeMake(is.width * sc, is.height * sc);
+                      CGRect fit = CGRectMake(slot.origin.x + (slot.size.width - fs.width) / 2, slot.origin.y + (slot.size.height - fs.height) / 2, fs.width, fs.height);
+                      CGContextSaveGState(c);
+                      [[UIBezierPath bezierPathWithRoundedRect:fit cornerRadius:8] addClip];
+                      [self.lastImage drawInRect:fit];
+                      CGContextRestoreGState(c);
+                  }
+              }
+          }
+
+          #pragma mark AVPictureInPictureSampleBufferPlaybackDelegate
+
+          - (void)pictureInPictureController:(AVPictureInPictureController *)c setPlaying:(BOOL)playing {
+          }
+          - (CMTimeRange)pictureInPictureControllerTimeRangeForPlayback:(AVPictureInPictureController *)c {
+              return CMTimeRangeMake(kCMTimeNegativeInfinity, kCMTimePositiveInfinity);
+          }
+          - (BOOL)pictureInPictureControllerIsPlaybackPaused:(AVPictureInPictureController *)c {
+              return NO;
+          }
+          - (void)pictureInPictureController:(AVPictureInPictureController *)c didTransitionToRenderSize:(CMVideoDimensions)newRenderSize {
+          }
+          - (void)pictureInPictureController:(AVPictureInPictureController *)c skipByInterval:(CMTime)skipInterval completionHandler:(void (^)(void))completionHandler {
+              completionHandler();
+          }
+
+          #pragma mark AVPictureInPictureControllerDelegate
+
+          - (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)c {
+              self.pipStatus = @"đang phát";
+          }
+          - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)c {
+              self.pipStatus = @"đã dừng";
+          }
+          - (void)pictureInPictureController:(AVPictureInPictureController *)c failedToStartPictureInPictureWithError:(NSError *)error {
+              self.pipStatus = [NSString stringWithFormat:@"lỗi: %@", error.localizedDescription];
+          }
+          - (void)pictureInPictureController:(AVPictureInPictureController *)c restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL))completionHandler {
+              completionHandler(YES);
+          }
+
+          #pragma mark Settings sheet UI
+
+          - (UIView *)row:(NSString *)t control:(UIView *)ctrl {
+              UILabel *l = MWLabel(t, 18, UIFontWeightRegular, MW_TEXT);
+              [l setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+              [ctrl setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+              UIStackView *h = [[UIStackView alloc] initWithArrangedSubviews:@[l, ctrl]];
+              h.axis = UILayoutConstraintAxisHorizontal;
+              h.alignment = UIStackViewAlignmentCenter;
+              [h.heightAnchor constraintGreaterThanOrEqualToConstant:52].active = YES;
+              return h;
+          }
+
+          - (UIView *)switchRow:(NSString *)t key:(NSString *)key def:(BOOL)d {
+              UISwitch *sw = [UISwitch new];
+              sw.onTintColor = MW_PURPLE;
+              sw.on = MWBool(key, d);
+              __weak UISwitch *wsw = sw;
+              __weak MWManager *ws = self;
+              [sw addAction:[UIAction actionWithHandler:^(UIAction *a) {
+                  MWSetObj(key, @(wsw.isOn));
+                  [ws settingChanged:key];
+              }] forControlEvents:UIControlEventValueChanged];
+              return [self row:t control:sw];
+          }
+
+          - (void)settingChanged:(NSString *)key {
+              if ([key isEqualToString:kEnabled]) {
+                  [self resetTracking];
+              }
+              if ([key isEqualToString:kAutoPiP] && self.pipController) {
+                  self.pipController.canStartPictureInPictureAutomaticallyFromInline = MWBool(kAutoPiP, YES);
+              }
+          }
+
+          static UIView *MWCard(NSArray<UIView *> *rows) {
+              UIView *card = [UIView new];
+              card.backgroundColor = MWRGB(255,255,255,0.55);
+              card.layer.cornerRadius = 22;
+              card.layer.borderWidth = 1;
+              card.layer.borderColor = MWRGB(150,108,225,0.35).CGColor;
+              UIStackView *s = [UIStackView new];
+              s.axis = UILayoutConstraintAxisVertical;
+              s.translatesAutoresizingMaskIntoConstraints = NO;
+              [card addSubview:s];
+              [NSLayoutConstraint activateConstraints:@[
+                  [s.topAnchor constraintEqualToAnchor:card.topAnchor constant:4],
+                  [s.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-4],
+                  [s.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+                  [s.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16]
+              ]];
+              for (NSUInteger i = 0; i < rows.count; i++) {
+                  [s addArrangedSubview:rows[i]];
+                  if (i + 1 < rows.count) {
+                      UIView *ln = [UIView new];
+                      ln.backgroundColor = MWRGB(150,108,225,0.22);
+                      [ln.heightAnchor constraintEqualToConstant:1].active = YES;
+                      [s addArrangedSubview:ln];
+                  }
+              }
+              return card;
+          }
+
+          static UILabel *MWSection(NSString *t) {
+              UILabel *l = [UILabel new];
+              l.attributedText = [[NSAttributedString alloc] initWithString:t attributes:@{
+                  NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightBold],
+                  NSForegroundColorAttributeName: MW_PURPLE,
+                  NSKernAttributeName: @2.5
+              }];
+              return l;
+          }
+
+          - (UIButton *)button:(NSString *)t filled:(BOOL)f action:(void (^)(void))a {
+              UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+              [b setTitle:t forState:UIControlStateNormal];
+              b.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+              b.layer.cornerRadius = 14;
+              b.backgroundColor = f ? MW_PURPLE : MWRGB(150,108,225,0.18);
+              [b setTitleColor:(f ? UIColor.whiteColor : MW_DEEP) forState:UIControlStateNormal];
+              [b addAction:[UIAction actionWithHandler:^(UIAction *x) { a(); }] forControlEvents:UIControlEventTouchUpInside];
+              [b.heightAnchor constraintEqualToConstant:46].active = YES;
+              return b;
+          }
+
+          - (void)toggleSheet {
+              if (self.sheet) [self hideSheet]; else [self showSheet];
+          }
+
+          - (void)showSheet {
+              if (self.sheet) return;
+              UIView *root = self.window.rootViewController.view;
+              CGSize sz = self.window.bounds.size;
+
+              self.dim = [[UIControl alloc] initWithFrame:root.bounds];
+              self.dim.backgroundColor = MWRGB(0,0,0,0.25);
+              [self.dim addTarget:self action:@selector(hideSheet) forControlEvents:UIControlEventTouchUpInside];
+              [root insertSubview:self.dim belowSubview:self.floatBtn];
+
+              CGFloat h = MIN(sz.height * 0.78, 640);
+              self.sheet = [[UIView alloc] initWithFrame:CGRectMake(0, sz.height, sz.width, h)];
+              self.sheet.layer.cornerRadius = 28;
+              self.sheet.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+              self.sheet.layer.masksToBounds = YES;
+              UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialLight]];
+              blur.frame = self.sheet.bounds;
+              blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              [self.sheet addSubview:blur];
+              UIView *tint = [[UIView alloc] initWithFrame:self.sheet.bounds];
+              tint.backgroundColor = MWRGB(243,238,250,0.65);
+              tint.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              [self.sheet addSubview:tint];
+
+              UIView *grab = [[UIView alloc] initWithFrame:CGRectMake(sz.width / 2 - 28, 10, 56, 6)];
+              grab.backgroundColor = MWRGB(150,108,225,0.5);
+              grab.layer.cornerRadius = 3;
+              [self.sheet addSubview:grab];
+
+              UIScrollView *sv = [UIScrollView new];
+              sv.translatesAutoresizingMaskIntoConstraints = NO;
+              [self.sheet addSubview:sv];
+              [NSLayoutConstraint activateConstraints:@[
+                  [sv.topAnchor constraintEqualToAnchor:self.sheet.topAnchor constant:28],
+                  [sv.leadingAnchor constraintEqualToAnchor:self.sheet.leadingAnchor],
+                  [sv.trailingAnchor constraintEqualToAnchor:self.sheet.trailingAnchor],
+                  [sv.bottomAnchor constraintEqualToAnchor:self.sheet.bottomAnchor]
+              ]];
+
+              UIStackView *st = [UIStackView new];
+              st.axis = UILayoutConstraintAxisVertical;
+              st.spacing = 12;
+              st.translatesAutoresizingMaskIntoConstraints = NO;
+              [sv addSubview:st];
+              [NSLayoutConstraint activateConstraints:@[
+                  [st.topAnchor constraintEqualToAnchor:sv.contentLayoutGuide.topAnchor constant:8],
+                  [st.bottomAnchor constraintEqualToAnchor:sv.contentLayoutGuide.bottomAnchor constant:-40],
+                  [st.leadingAnchor constraintEqualToAnchor:sv.contentLayoutGuide.leadingAnchor constant:16],
+                  [st.trailingAnchor constraintEqualToAnchor:sv.contentLayoutGuide.trailingAnchor constant:-16],
+                  [st.widthAnchor constraintEqualToAnchor:sv.frameLayoutGuide.widthAnchor constant:-32]
+              ]];
+
+              [st addArrangedSubview:MWSection(@"FEATURES")];
+              [st addArrangedSubview:MWCard(@[
+                  [self switchRow:@"Bật theo dõi" key:kEnabled def:NO],
+                  [self switchRow:@"Rung khi có tin mới" key:kHaptic def:YES],
+                  [self switchRow:@"Âm báo khi có tin mới" key:kSound def:NO],
+                  [self switchRow:@"Tự bật PiP khi thoát app" key:kAutoPiP def:YES]
+              ])];
+
+              [st addArrangedSubview:MWSection(@"THEO DÕI")];
+              UILabel *tl = MWLabel(@"Chu kỳ quét", 18, UIFontWeightRegular, MW_TEXT);
+              self.intervalValue = MWLabel([NSString stringWithFormat:@"%.1fs", MWDouble(kInterval, 1.5)], 18, UIFontWeightSemibold, MW_PURPLE);
+              UIStackView *top = [[UIStackView alloc] initWithArrangedSubviews:@[tl, self.intervalValue]];
+              top.axis = UILayoutConstraintAxisHorizontal;
+              UISlider *sl = [UISlider new];
+              sl.minimumValue = 0.5;
+              sl.maximumValue = 5.0;
+              sl.value = (float)MWDouble(kInterval, 1.5);
+              sl.minimumTrackTintColor = MW_PURPLE;
+              __weak MWManager *ws = self;
+              __weak UISlider *wsl = sl;
+              [sl addAction:[UIAction actionWithHandler:^(UIAction *a) {
+                  double v = round(wsl.value * 10) / 10.0;
+                  MWSetObj(kInterval, @(v));
+                  ws.intervalValue.text = [NSString stringWithFormat:@"%.1fs", v];
+              }] forControlEvents:UIControlEventValueChanged];
+              [sl addAction:[UIAction actionWithHandler:^(UIAction *a) {
+                  [ws restartScanTimer];
+              }] forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+              UIStackView *sr = [[UIStackView alloc] initWithArrangedSubviews:@[top, sl]];
+              sr.axis = UILayoutConstraintAxisVertical;
+              sr.spacing = 10;
+              sr.layoutMarginsRelativeArrangement = YES;
+              sr.layoutMargins = UIEdgeInsetsMake(12, 0, 12, 0);
+              [st addArrangedSubview:MWCard(@[sr])];
+
+              [st addArrangedSubview:[self button:@"Chọn vùng chat" filled:YES action:^{ [ws beginSelection]; }]];
+              [st addArrangedSubview:[self button:@"Mở Cửa Sổ Nổi (PiP)" filled:YES action:^{ [ws startPiP]; }]];
+              [st addArrangedSubview:[self button:@"Tắt PiP" filled:NO action:^{ [ws stopPiP]; }]];
+              [st addArrangedSubview:[self button:@"Đặt lại bộ đếm tin mới" filled:NO action:^{ [ws resetTracking]; }]];
+
+              [st addArrangedSubview:MWSection(@"TRẠNG THÁI")];
+              self.statusLabel = MWLabel(@"", 14, UIFontWeightRegular, MW_TEXT);
+              self.statusLabel.numberOfLines = 0;
+              UIStackView *stRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.statusLabel]];
+              stRow.axis = UILayoutConstraintAxisVertical;
+              stRow.layoutMarginsRelativeArrangement = YES;
+              stRow.layoutMargins = UIEdgeInsetsMake(12, 0, 12, 0);
+              [st addArrangedSubview:MWCard(@[stRow])];
+
+              [root insertSubview:self.sheet belowSubview:self.floatBtn];
+              [self refreshStatus];
+              [UIView animateWithDuration:0.28 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+                  self.sheet.frame = CGRectMake(0, sz.height - h, sz.width, h);
+              } completion:nil];
+              self.uiTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+                  [ws refreshStatus];
+              }];
+          }
+
+          - (void)hideSheet {
+              if (!self.sheet) return;
+              [self.uiTimer invalidate];
+              self.uiTimer = nil;
+              UIView *s = self.sheet, *d = self.dim;
+              self.sheet = nil;
+              self.dim = nil;
+              self.statusLabel = nil;
+              CGSize sz = self.window.bounds.size;
+              [UIView animateWithDuration:0.22 animations:^{
+                  s.frame = CGRectMake(0, sz.height, sz.width, s.frame.size.height);
+                  d.alpha = 0;
+              } completion:^(BOOL f) {
+                  [s removeFromSuperview];
+                  [d removeFromSuperview];
+              }];
+          }
+
+          - (void)refreshStatus {
+              if (!self.statusLabel) return;
+              CGRect r = MWRegion();
+              NSString *reg = CGRectIsNull(r) ? @"chưa chọn" : [NSString stringWithFormat:@"đã chọn (%.0f%%, %.0f%%, %.0f%%, %.0f%%)", r.origin.x * 100, r.origin.y * 100, r.size.width * 100, r.size.height * 100];
+              self.statusLabel.text = [NSString stringWithFormat:
+                  @"Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld • Tin mới: %ld\nDòng chữ đọc được: %lu\nChụp ảnh: %@\nPiP: %@",
+                  MWBool(kEnabled, NO) ? @"đang chạy" : @"tắt",
+                  reg,
+                  (long)self.scanCount, (long)self.newCount,
+                  (unsigned long)self.latestLines.count,
+                  self.captureInfo,
+                  self.pipStatus];
+          }
+
+          #pragma mark Region selection
+
+          - (void)beginSelection {
+              [self hideSheet];
+              self.floatBtn.hidden = YES;
+              UIView *root = self.window.rootViewController.view;
+              self.selView = [[MWSelectionView alloc] initWithFrame:root.bounds];
+              __weak MWManager *ws = self;
+              self.selView.onCancel = ^{
+                  [ws endSelection];
+              };
+              self.selView.onDone = ^(CGRect n) {
+                  MWSetRegion(n);
+                  [ws resetTracking];
+                  [ws endSelection];
+              };
+              [root addSubview:self.selView];
+          }
+
+          - (void)endSelection {
+              [self.selView removeFromSuperview];
+              self.selView = nil;
+              self.floatBtn.hidden = NO;
+          }
+
+          @end
+
+          __attribute__((constructor)) static void MWInit(void) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+                      [[MWManager shared] setupIfPossible];
+                  }];
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                      [[MWManager shared] setupIfPossible];
+                  });
+              });
+          }
+          MW_EOF
+
+      - name: Compile (arm64 + arm64e)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          FW="-framework UIKit -framework Foundation -framework AVFoundation -framework AVKit -framework CoreMedia -framework CoreVideo -framework CoreGraphics -framework QuartzCore -framework Vision -framework AudioToolbox"
+          clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -fobjc-arc -O2 -dynamiclib \
+            -install_name @executable_path/Frameworks/MuseWatch.dylib $FW MuseWatch.m -o MuseWatch_arm64.dylib
+          OUT="MuseWatch_arm64.dylib"
+          if clang -arch arm64e -isysroot "$SDK" -miphoneos-version-min=15.0 -fobjc-arc -O2 -dynamiclib \
+            -install_name @executable_path/Frameworks/MuseWatch.dylib $FW MuseWatch.m -o MuseWatch_arm64e.dylib; then
+            lipo -create MuseWatch_arm64.dylib MuseWatch_arm64e.dylib -output MuseWatch.dylib
+          else
+            echo "arm64e build failed, using arm64 only"
+            cp MuseWatch_arm64.dylib MuseWatch.dylib
+          fi
+          codesign -f -s - MuseWatch.dylib
+          lipo -info MuseWatch.dylib
+          mkdir -p build
+          cp MuseWatch.dylib build/MuseWatch.dylib
+          ls -la build
+
+      - name: Commit dylib
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add build/MuseWatch.dylib
+          git commit -m "build MuseWatch.dylib" || echo "nothing to commit"
+          git pull --rebase || true
+          git push
+
