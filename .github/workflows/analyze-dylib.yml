@@ -1,0 +1,75 @@
+name: Analyze Ziga dylib
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download dylib from Drive
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install gdown
+          /tmp/venv/bin/gdown "https://drive.google.com/uc?id=1dnNiK6zJhbAb3tJsN1_k9npqK41C2pXh" -O /tmp/Ziga_AI.dylib
+          ls -la /tmp/Ziga_AI.dylib
+
+      - name: Extract info
+        run: |
+          mkdir -p analysis
+          D=/tmp/Ziga_AI.dylib
+          {
+            file "$D"
+            lipo -info "$D" || true
+            ls -la "$D"
+          } > analysis/00_info.txt 2>&1
+
+          # Lay slice arm64 neu la fat
+          if lipo -info "$D" 2>/dev/null | grep -q "Architectures in the fat file"; then
+            lipo -thin arm64 "$D" -output /tmp/thin.dylib || cp "$D" /tmp/thin.dylib
+          else
+            cp "$D" /tmp/thin.dylib
+          fi
+          T=/tmp/thin.dylib
+
+          otool -L "$T"          > analysis/01_linked_libs.txt 2>&1
+          otool -hv "$T"         > analysis/02_header.txt 2>&1
+          otool -l "$T" | grep -E "segname|sectname|size|cryptid" > analysis/03_segments.txt 2>&1
+          nm -gU "$T"            2>/dev/null | head -c 200000 > analysis/04_exports.txt
+
+          # Chuoi ky tu lien quan UI / PiP
+          strings -a "$T" > /tmp/all_strings.txt
+          wc -l /tmp/all_strings.txt > analysis/05_strings_count.txt
+
+          grep -E "AVPictureInPicture|AVSampleBufferDisplayLayer|AVAudioSession|AVPlayer|CMSampleBuffer|CVPixelBuffer|CMTimebase|AVKit|PiP|Pip|pip" /tmp/all_strings.txt \
+            | sort -u | head -c 150000 > analysis/10_pip_strings.txt
+
+          grep -E "UIVisualEffectView|UIBlurEffect|UISheetPresentationController|UISheet|detents|CAGradientLayer|UISwitch|UISlider|UIPanGesture|UIWindow|windowLevel|UIImpactFeedback|cornerRadius|cornerCurve|onTintColor|CABasicAnimation|UIViewPropertyAnimator|UISpringTiming|UIFont|UIColor|colorWithRed" /tmp/all_strings.txt \
+            | sort -u | head -c 150000 > analysis/11_ui_strings.txt
+
+          # Class / method ObjC
+          otool -ov "$T" > /tmp/objc_full.txt 2>&1 || true
+          wc -l /tmp/objc_full.txt > analysis/20_objc_lines.txt
+          grep -E "name 0x[0-9a-f]+ [A-Za-z_]" /tmp/objc_full.txt | head -c 400000 > analysis/21_objc_names.txt
+
+          # Danh sach class
+          grep -B1 -A3 "isa 0x" /tmp/objc_full.txt | grep -E "name 0x" | sort -u | head -c 100000 > analysis/22_class_names.txt
+
+          # Disassemble nhe: symbol lien quan PiP/UI de lan sau soi tiep
+          nm "$T" 2>/dev/null | grep -iE "pip|picture|window|sheet|overlay|panel|menu|setting|toggle|slider" | head -c 100000 > analysis/23_symbols_ui_pip.txt
+
+          du -sh analysis/* > analysis/99_sizes.txt
+          cat analysis/99_sizes.txt
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add analysis
+          git commit -m "dylib analysis output" || echo "nothing to commit"
+          git push
