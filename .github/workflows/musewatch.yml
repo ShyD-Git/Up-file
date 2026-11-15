@@ -58,10 +58,49 @@ jobs:
           }
           static void MWPost(id self, SEL _cmd, NSNotificationName name, id obj, NSDictionary *ui) {
               if (gKeepAwake && ([name isEqualToString:UIApplicationDidEnterBackgroundNotification] ||
-                                 [name isEqualToString:UIApplicationWillResignActiveNotification])) {
+                                 [name isEqualToString:UIApplicationWillResignActiveNotification] ||
+                                 [name isEqualToString:UISceneDidEnterBackgroundNotification] ||
+                                 [name isEqualToString:UISceneWillDeactivateNotification])) {
                   return;
               }
               ((void (*)(id, SEL, NSNotificationName, id, NSDictionary *))gOrigPost)(self, _cmd, name, obj, ui);
+          }
+          static IMP gO_appBg = NULL, gO_appResign = NULL, gO_sceneBg = NULL, gO_sceneResign = NULL;
+          static void MW_appBg(id self, SEL _cmd, id a) {
+              if (gKeepAwake) return;
+              ((void (*)(id, SEL, id))gO_appBg)(self, _cmd, a);
+          }
+          static void MW_appResign(id self, SEL _cmd, id a) {
+              if (gKeepAwake) return;
+              ((void (*)(id, SEL, id))gO_appResign)(self, _cmd, a);
+          }
+          static void MW_sceneBg(id self, SEL _cmd, id a) {
+              if (gKeepAwake) return;
+              ((void (*)(id, SEL, id))gO_sceneBg)(self, _cmd, a);
+          }
+          static void MW_sceneResign(id self, SEL _cmd, id a) {
+              if (gKeepAwake) return;
+              ((void (*)(id, SEL, id))gO_sceneResign)(self, _cmd, a);
+          }
+          static void MWHookOne(Class c, SEL sel, IMP imp, IMP *orig) {
+              if (*orig || !c) return;
+              Method m = class_getInstanceMethod(c, sel);
+              if (m) *orig = method_setImplementation(m, imp);
+          }
+          static void MWInstallDelegateHooks(void) {
+              id ad = UIApplication.sharedApplication.delegate;
+              if (ad) {
+                  Class c = object_getClass(ad);
+                  MWHookOne(c, @selector(applicationDidEnterBackground:), (IMP)MW_appBg, &gO_appBg);
+                  MWHookOne(c, @selector(applicationWillResignActive:), (IMP)MW_appResign, &gO_appResign);
+              }
+              for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+                  id d = sc.delegate;
+                  if (!d) continue;
+                  Class c = object_getClass(d);
+                  MWHookOne(c, @selector(sceneDidEnterBackground:), (IMP)MW_sceneBg, &gO_sceneBg);
+                  MWHookOne(c, @selector(sceneWillResignActive:), (IMP)MW_sceneResign, &gO_sceneResign);
+              }
           }
           static void MWInstallAwakeHooks(void) {
               static dispatch_once_t once;
@@ -435,6 +474,7 @@ jobs:
               self.startTime = [NSDate date];
               gKeepAwake = MWBool(kAwake, NO);
               MWInstallAwakeHooks();
+              MWInstallDelegateHooks();
               [self restartScanTimer];
               NSLog(@"[MuseWatch] ready");
           }
@@ -1107,7 +1147,7 @@ jobs:
               CGRect r = MWRegion();
               NSString *reg = CGRectIsNull(r) ? @"chưa chọn" : [NSString stringWithFormat:@"đã chọn (%.0f%%, %.0f%%, %.0f%%, %.0f%%)", r.origin.x * 100, r.origin.y * 100, r.size.width * 100, r.size.height * 100];
               self.statusLabel.text = [NSString stringWithFormat:
-                  @"v1.3 • Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld • Tin mới: %ld\nDòng chữ đọc được: %lu\nOCR: %@\nChụp ảnh: %@\nẢnh đổi: %.1f (lần cuối: %@)\nLỗi chụp: %ld • Ảnh trống: %ld\nNền: ok=%ld trống=%ld • app=%ld\nCửa sổ: %@\nPiP: %@",
+                  @"v1.4 • Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld • Tin mới: %ld\nDòng chữ đọc được: %lu\nOCR: %@\nChụp ảnh: %@\nẢnh đổi: %.1f (lần cuối: %@)\nLỗi chụp: %ld • Ảnh trống: %ld\nNền: ok=%ld trống=%ld • app=%ld\nCửa sổ: %@\nHook: appBg=%d appRes=%d sceneBg=%d sceneRes=%d\nPiP: %@",
                   MWBool(kEnabled, NO) ? @"đang chạy" : @"tắt",
                   reg,
                   (long)self.scanCount, (long)self.newCount,
@@ -1119,6 +1159,7 @@ jobs:
                   (long)self.capFail, (long)self.blankCount,
                   (long)self.bgOK, (long)self.bgBlank, (long)MWRealState(),
                   [self windowDump],
+                  (int)(gO_appBg != NULL), (int)(gO_appResign != NULL), (int)(gO_sceneBg != NULL), (int)(gO_sceneResign != NULL),
                   self.pipStatus];
           }
 
