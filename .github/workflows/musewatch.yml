@@ -40,6 +40,18 @@ jobs:
           static BOOL gKeepAwake = NO;
           static IMP gOrigAppState = NULL;
           static IMP gOrigPost = NULL;
+          static IMP gOrigSetHidden = NULL;
+          static UIApplicationState MWRealState(void) {
+              UIApplication *a = UIApplication.sharedApplication;
+              if (gOrigAppState) return ((UIApplicationState (*)(id, SEL))gOrigAppState)(a, @selector(applicationState));
+              return a.applicationState;
+          }
+          static void MWSetHidden(UIWindow *self, SEL _cmd, BOOL h) {
+              if (gKeepAwake && h && ![NSStringFromClass(self.class) isEqualToString:@"MWPassWindow"] && MWRealState() != UIApplicationStateActive) {
+                  return;
+              }
+              ((void (*)(id, SEL, BOOL))gOrigSetHidden)(self, _cmd, h);
+          }
           static UIApplicationState MWAppState(id self, SEL _cmd) {
               if (gKeepAwake) return UIApplicationStateActive;
               return ((UIApplicationState (*)(id, SEL))gOrigAppState)(self, _cmd);
@@ -58,6 +70,8 @@ jobs:
                   if (m1) gOrigAppState = method_setImplementation(m1, (IMP)MWAppState);
                   Method m2 = class_getInstanceMethod(NSNotificationCenter.class, @selector(postNotificationName:object:userInfo:));
                   if (m2) gOrigPost = method_setImplementation(m2, (IMP)MWPost);
+                  Method m3 = class_getInstanceMethod(UIWindow.class, @selector(setHidden:));
+                  if (m3) gOrigSetHidden = method_setImplementation(m3, (IMP)MWSetHidden);
               });
           }
 
@@ -172,6 +186,32 @@ jobs:
               return lines;
           }
 
+          static NSString *MWKey(NSString *s) {
+              NSString *d = [[s lowercaseString] decomposedStringWithCanonicalMapping];
+              NSMutableString *o = [NSMutableString string];
+              for (NSUInteger i = 0; i < d.length; i++) {
+                  unichar c = [d characterAtIndex:i];
+                  if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) [o appendFormat:@"%C", c];
+              }
+              return o;
+          }
+
+          static double MWDice(NSString *a, NSString *b) {
+              if (a.length < 2 || b.length < 2) return [a isEqualToString:b] ? 1.0 : 0.0;
+              NSMutableDictionary<NSString *, NSNumber *> *cnt = [NSMutableDictionary dictionary];
+              for (NSUInteger i = 0; i + 1 < a.length; i++) {
+                  NSString *g = [a substringWithRange:NSMakeRange(i, 2)];
+                  cnt[g] = @([cnt[g] integerValue] + 1);
+              }
+              NSUInteger inter = 0;
+              for (NSUInteger i = 0; i + 1 < b.length; i++) {
+                  NSString *g = [b substringWithRange:NSMakeRange(i, 2)];
+                  NSInteger c = [cnt[g] integerValue];
+                  if (c > 0) { inter++; cnt[g] = @(c - 1); }
+              }
+              return (2.0 * inter) / ((a.length - 1) + (b.length - 1));
+          }
+
           #pragma mark - Passthrough window
 
           @interface MWPassWindow : UIWindow
@@ -189,6 +229,7 @@ jobs:
           @interface MWSelectionView : UIView
           @property (nonatomic, copy) void (^onDone)(CGRect normRect);
           @property (nonatomic, copy) void (^onCancel)(void);
+          @property (nonatomic, copy) void (^onFull)(void);
           @property (nonatomic) CGRect sel;
           @property (nonatomic, strong) UILabel *hint;
           @end
@@ -211,7 +252,7 @@ jobs:
                   CGFloat y = f.size.height - 110;
                   UIButton *cancel = [UIButton buttonWithType:UIButtonTypeSystem];
                   [cancel setTitle:@"Hủy" forState:UIControlStateNormal];
-                  cancel.frame = CGRectMake(f.size.width / 2 - 150, y, 140, 48);
+                  cancel.frame = CGRectMake(f.size.width / 2 - 165, y, 100, 48);
                   cancel.backgroundColor = MWRGB(255,255,255,0.25);
                   cancel.layer.cornerRadius = 14;
                   [cancel setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
@@ -220,13 +261,24 @@ jobs:
 
                   UIButton *done = [UIButton buttonWithType:UIButtonTypeSystem];
                   [done setTitle:@"Xong" forState:UIControlStateNormal];
-                  done.frame = CGRectMake(f.size.width / 2 + 10, y, 140, 48);
+                  done.frame = CGRectMake(f.size.width / 2 + 65, y, 100, 48);
                   done.backgroundColor = MW_PURPLE;
                   done.layer.cornerRadius = 14;
                   [done setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
                   done.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
                   [done addTarget:self action:@selector(doneTap) forControlEvents:UIControlEventTouchUpInside];
                   [self addSubview:done];
+
+                  UIButton *full = [UIButton buttonWithType:UIButtonTypeSystem];
+                  [full setTitle:@"Toàn màn hình" forState:UIControlStateNormal];
+                  full.frame = CGRectMake(f.size.width / 2 - 55, y, 110, 48);
+                  full.backgroundColor = MWRGB(255,255,255,0.25);
+                  full.layer.cornerRadius = 14;
+                  full.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+                  full.titleLabel.adjustsFontSizeToFitWidth = YES;
+                  [full setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+                  [full addTarget:self action:@selector(fullTap) forControlEvents:UIControlEventTouchUpInside];
+                  [self addSubview:full];
               }
               return self;
           }
@@ -248,6 +300,9 @@ jobs:
               CGRect r = CGRectMake(MIN(s.x, p.x), MIN(s.y, p.y), fabs(t.x), fabs(t.y));
               _sel = CGRectIntersection(r, self.bounds);
               [self setNeedsDisplay];
+          }
+          - (void)fullTap {
+              if (self.onFull) self.onFull();
           }
           - (void)cancelTap {
               if (self.onCancel) self.onCancel();
@@ -287,7 +342,7 @@ jobs:
           @property (nonatomic, strong) NSDate *lastNewDate;
           @property (nonatomic, strong) NSArray<NSString *> *latestLines;
           @property (nonatomic, strong) NSMutableArray<NSString *> *recentNew;
-          @property (nonatomic, strong) NSMutableSet<NSString *> *known;
+          @property (nonatomic, strong) NSMutableArray<NSString *> *known;
           @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *candidates;
           @property (nonatomic) BOOL baselineDone;
           @property (nonatomic) BOOL ocrBusy;
@@ -309,6 +364,8 @@ jobs:
           @property (nonatomic) BOOL captureBlank;
           @property (nonatomic) NSInteger capFail;
           @property (nonatomic) NSInteger blankCount;
+          @property (nonatomic) NSInteger bgOK;
+          @property (nonatomic) NSInteger bgBlank;
           @end
 
           @implementation MWManager
@@ -319,7 +376,7 @@ jobs:
               dispatch_once(&once, ^{
                   m = [MWManager new];
                   m.recentNew = [NSMutableArray array];
-                  m.known = [NSMutableSet set];
+                  m.known = [NSMutableArray array];
                   m.candidates = [NSMutableDictionary dictionary];
                   m.latestLines = @[];
                   m.captureInfo = @"chưa quét";
@@ -434,8 +491,7 @@ jobs:
               return [rd imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
                   CGContextTranslateCTM(ctx.CGContext, -r.origin.x, -r.origin.y);
                   if (mode == 0) {
-                      BOOL inactive = (UIApplication.sharedApplication.applicationState != UIApplicationStateActive);
-                      [tw drawViewHierarchyInRect:tw.bounds afterScreenUpdates:inactive];
+                      [tw drawViewHierarchyInRect:tw.bounds afterScreenUpdates:NO];
                   } else {
                       [tw.layer renderInContext:ctx.CGContext];
                   }
@@ -458,6 +514,9 @@ jobs:
                   else { m = @"ẢNH TRỐNG/ĐEN"; blank = YES; }
               }
               self.captureBlank = blank;
+              if (MWRealState() != UIApplicationStateActive) {
+                  if (blank) self.bgBlank++; else self.bgOK++;
+              }
               self.captureInfo = [NSString stringWithFormat:@"%@ [scene=%ld hidden=%d]", m, (long)tw.windowScene.activationState, (int)tw.hidden];
               return img;
           }
@@ -514,14 +573,27 @@ jobs:
               return [[s lowercaseString] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
           }
 
+          - (void)addKnown:(NSString *)k {
+              [self.known addObject:k];
+              while (self.known.count > 500) [self.known removeObjectAtIndex:0];
+          }
+
+          - (BOOL)isKnown:(NSString *)k {
+              if ([self.known containsObject:k]) return YES;
+              for (NSString *x in self.known) {
+                  if (MWDice(x, k) >= 0.62) return YES;
+              }
+              return NO;
+          }
+
           - (void)processLines:(NSArray<NSString *> *)lines {
               self.ocrBusy = NO;
               self.scanCount++;
               self.latestLines = lines;
               if (!self.baselineDone) {
                   for (NSString *l in lines) {
-                      NSString *n = MWNorm(l);
-                      if (n.length >= 3) [self.known addObject:n];
+                      NSString *k = MWKey(l);
+                      if (k.length >= 3) [self addKnown:k];
                   }
                   self.baselineDone = YES;
                   return;
@@ -529,14 +601,18 @@ jobs:
               NSMutableDictionary *newCand = [NSMutableDictionary dictionary];
               NSMutableArray *fresh = [NSMutableArray array];
               for (NSString *l in lines) {
-                  NSString *n = MWNorm(l);
-                  if (n.length < 3 || [self.known containsObject:n]) continue;
-                  NSInteger c = [self.candidates[n] integerValue] + 1;
-                  if (c >= 2) {
-                      [self.known addObject:n];
+                  NSString *k = MWKey(l);
+                  if (k.length < 3 || [self isKnown:k]) continue;
+                  NSString *ck = nil;
+                  for (NSString *c in self.candidates) {
+                      if ([c isEqualToString:k] || MWDice(c, k) >= 0.8) { ck = c; break; }
+                  }
+                  NSInteger cnt = ck ? [self.candidates[ck] integerValue] + 1 : 1;
+                  if (cnt >= 2) {
+                      [self addKnown:k];
                       [fresh addObject:l];
                   } else {
-                      newCand[n] = @(c);
+                      newCand[ck ?: k] = @(cnt);
                   }
               }
               self.candidates = newCand;
@@ -969,6 +1045,11 @@ jobs:
               [st addArrangedSubview:MWCard(@[sr])];
 
               [st addArrangedSubview:[self button:@"Chọn vùng chat" filled:YES action:^{ [ws beginSelection]; }]];
+              [st addArrangedSubview:[self button:@"Chọn toàn màn hình (nhanh)" filled:YES action:^{
+                  MWSetRegion(CGRectMake(0, 0, 1, 1));
+                  [ws resetTracking];
+                  [ws refreshStatus];
+              }]];
               [st addArrangedSubview:[self button:@"Mở Cửa Sổ Nổi (PiP)" filled:YES action:^{ [ws startPiP]; }]];
               [st addArrangedSubview:[self button:@"Tắt PiP" filled:NO action:^{ [ws stopPiP]; }]];
               [st addArrangedSubview:[self button:@"Đặt lại bộ đếm tin mới" filled:NO action:^{ [ws resetTracking]; }]];
@@ -1010,12 +1091,23 @@ jobs:
               }];
           }
 
+          - (NSString *)windowDump {
+              NSMutableArray *a = [NSMutableArray array];
+              for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+                  if (![sc isKindOfClass:UIWindowScene.class]) continue;
+                  for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                      [a addObject:[NSString stringWithFormat:@"%@(L%.0f h%d%@)", NSStringFromClass(w.class), w.windowLevel, (int)w.hidden, w.isKeyWindow ? @" key" : @""]];
+                  }
+              }
+              return a.count ? [a componentsJoinedByString:@" "] : @"(không có)";
+          }
+
           - (void)refreshStatus {
               if (!self.statusLabel) return;
               CGRect r = MWRegion();
               NSString *reg = CGRectIsNull(r) ? @"chưa chọn" : [NSString stringWithFormat:@"đã chọn (%.0f%%, %.0f%%, %.0f%%, %.0f%%)", r.origin.x * 100, r.origin.y * 100, r.size.width * 100, r.size.height * 100];
               self.statusLabel.text = [NSString stringWithFormat:
-                  @"v1.2 • Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld • Tin mới: %ld\nDòng chữ đọc được: %lu\nOCR: %@\nChụp ảnh: %@\nẢnh đổi: %.1f (lần cuối: %@)\nLỗi chụp: %ld • Ảnh trống: %ld\nPiP: %@",
+                  @"v1.3 • Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld • Tin mới: %ld\nDòng chữ đọc được: %lu\nOCR: %@\nChụp ảnh: %@\nẢnh đổi: %.1f (lần cuối: %@)\nLỗi chụp: %ld • Ảnh trống: %ld\nNền: ok=%ld trống=%ld • app=%ld\nCửa sổ: %@\nPiP: %@",
                   MWBool(kEnabled, NO) ? @"đang chạy" : @"tắt",
                   reg,
                   (long)self.scanCount, (long)self.newCount,
@@ -1025,6 +1117,8 @@ jobs:
                   self.imgDiff,
                   self.lastChange ? [NSString stringWithFormat:@"%.0f giây trước", [[NSDate date] timeIntervalSinceDate:self.lastChange]] : @"chưa có",
                   (long)self.capFail, (long)self.blankCount,
+                  (long)self.bgOK, (long)self.bgBlank, (long)MWRealState(),
+                  [self windowDump],
                   self.pipStatus];
           }
 
@@ -1037,6 +1131,11 @@ jobs:
               self.selView = [[MWSelectionView alloc] initWithFrame:root.bounds];
               __weak MWManager *ws = self;
               self.selView.onCancel = ^{
+                  [ws endSelection];
+              };
+              self.selView.onFull = ^{
+                  MWSetRegion(CGRectMake(0, 0, 1, 1));
+                  [ws resetTracking];
                   [ws endSelection];
               };
               self.selView.onDone = ^(CGRect n) {
