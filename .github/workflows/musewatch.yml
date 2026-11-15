@@ -263,6 +263,27 @@ jobs:
           }
           @end
 
+          // Hiệu ứng bấm: nút co lại + mờ đi + rung nhẹ khi chạm, bật lại dạng lò xo khi nhả
+          static void MWPressFX(UIButton *b) {
+              __weak UIButton *wb = b;
+              UIAction *down = [UIAction actionWithHandler:^(UIAction *x) {
+                  UIImpactFeedbackGenerator *g = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+                  [g impactOccurred];
+                  [UIView animateWithDuration:0.08 delay:0 options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction animations:^{
+                      wb.transform = CGAffineTransformMakeScale(0.92, 0.92);
+                      wb.alpha = 0.6;
+                  } completion:nil];
+              }];
+              UIAction *up = [UIAction actionWithHandler:^(UIAction *x) {
+                  [UIView animateWithDuration:0.3 delay:0 usingSpringWithDamping:0.5 initialSpringVelocity:8 options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction animations:^{
+                      wb.transform = CGAffineTransformIdentity;
+                      wb.alpha = 1.0;
+                  } completion:nil];
+              }];
+              [b addAction:down forControlEvents:UIControlEventTouchDown | UIControlEventTouchDragEnter];
+              [b addAction:up forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
+          }
+
           #pragma mark - Region selection view
 
           @interface MWSelectionView : UIView
@@ -297,6 +318,7 @@ jobs:
                   [cancel setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
                   [cancel addTarget:self action:@selector(cancelTap) forControlEvents:UIControlEventTouchUpInside];
                   [self addSubview:cancel];
+                  MWPressFX(cancel);
 
                   UIButton *done = [UIButton buttonWithType:UIButtonTypeSystem];
                   [done setTitle:@"Xong" forState:UIControlStateNormal];
@@ -307,6 +329,7 @@ jobs:
                   done.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
                   [done addTarget:self action:@selector(doneTap) forControlEvents:UIControlEventTouchUpInside];
                   [self addSubview:done];
+                  MWPressFX(done);
 
                   UIButton *full = [UIButton buttonWithType:UIButtonTypeSystem];
                   [full setTitle:@"Toàn màn hình" forState:UIControlStateNormal];
@@ -318,6 +341,7 @@ jobs:
                   [full setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
                   [full addTarget:self action:@selector(fullTap) forControlEvents:UIControlEventTouchUpInside];
                   [self addSubview:full];
+                  MWPressFX(full);
               }
               return self;
           }
@@ -405,6 +429,9 @@ jobs:
           @property (nonatomic) NSInteger blankCount;
           @property (nonatomic) NSInteger bgOK;
           @property (nonatomic) NSInteger bgBlank;
+          @property (nonatomic) NSInteger ocrCount;
+          @property (nonatomic) BOOL needOCR;
+          @property (nonatomic) BOOL pipWantsStop;
           @end
 
           @implementation MWManager
@@ -457,22 +484,23 @@ jobs:
 
               CGSize sz = self.window.bounds.size;
               self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-              self.floatBtn.frame = CGRectMake(sz.width - 64, 150, 46, 46);
+              self.floatBtn.frame = CGRectMake(sz.width - 50, 150, 36, 36);
               self.floatBtn.backgroundColor = MW_PURPLE;
-              self.floatBtn.layer.cornerRadius = 23;
+              self.floatBtn.layer.cornerRadius = 18;
               self.floatBtn.layer.shadowColor = UIColor.blackColor.CGColor;
               self.floatBtn.layer.shadowOpacity = 0.3;
               self.floatBtn.layer.shadowRadius = 6;
               self.floatBtn.layer.shadowOffset = CGSizeMake(0, 3);
               [self.floatBtn setTitle:@"M" forState:UIControlStateNormal];
-              self.floatBtn.titleLabel.font = [UIFont systemFontOfSize:20 weight:UIFontWeightBold];
+              self.floatBtn.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
               [self.floatBtn addTarget:self action:@selector(toggleSheet) forControlEvents:UIControlEventTouchUpInside];
+              MWPressFX(self.floatBtn);
               UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragBtn:)];
               [self.floatBtn addGestureRecognizer:pan];
               [vc.view addSubview:self.floatBtn];
 
               self.startTime = [NSDate date];
-              gKeepAwake = MWBool(kAwake, NO);
+              gKeepAwake = MWBool(kAwake, YES);
               MWInstallAwakeHooks();
               MWInstallDelegateHooks();
               [self restartScanTimer];
@@ -487,7 +515,7 @@ jobs:
 
           - (void)restartScanTimer {
               [self.scanTimer invalidate];
-              double iv = MWDouble(kInterval, 1.5);
+              double iv = MWDouble(kInterval, 2.0);
               __weak MWManager *ws = self;
               self.scanTimer = [NSTimer scheduledTimerWithTimeInterval:iv repeats:YES block:^(NSTimer *t) {
                   [ws scanTick];
@@ -504,6 +532,8 @@ jobs:
               self.lastNewDate = nil;
               self.prevThumb = nil;
               self.pendingDiff = NO;
+              self.needOCR = NO;
+              self.ocrCount = 0;
               self.startTime = [NSDate date];
           }
 
@@ -523,10 +553,10 @@ jobs:
               return best ?: self.lastTarget;
           }
 
-          - (UIImage *)renderWindow:(UIWindow *)tw rect:(CGRect)r mode:(int)mode {
+          - (UIImage *)renderWindow:(UIWindow *)tw rect:(CGRect)r mode:(int)mode scale:(CGFloat)sc {
               UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat preferredFormat];
               f.opaque = YES;
-              if (f.scale > 2) f.scale = 2;
+              if (sc > 0) f.scale = sc; else if (f.scale > 2) f.scale = 2;
               UIGraphicsImageRenderer *rd = [[UIGraphicsImageRenderer alloc] initWithSize:r.size format:f];
               return [rd imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
                   CGContextTranslateCTM(ctx.CGContext, -r.origin.x, -r.origin.y);
@@ -538,18 +568,18 @@ jobs:
               }];
           }
 
-          - (UIImage *)captureRegion:(CGRect)n {
+          - (UIImage *)captureRegion:(CGRect)n scale:(CGFloat)sc {
               UIWindow *tw = [self targetWindow];
               if (!tw) { self.captureInfo = @"không tìm thấy cửa sổ app"; return nil; }
               CGRect b = tw.bounds;
               CGRect r = CGRectMake(n.origin.x * b.size.width, n.origin.y * b.size.height, n.size.width * b.size.width, n.size.height * b.size.height);
               r = CGRectIntersection(r, b);
               if (CGRectIsNull(r) || r.size.width < 20 || r.size.height < 20) { self.captureInfo = @"vùng chọn không hợp lệ"; return nil; }
-              UIImage *img = [self renderWindow:tw rect:r mode:0];
+              UIImage *img = [self renderWindow:tw rect:r mode:0 scale:sc];
               NSString *m = @"drawViewHierarchy";
               BOOL blank = NO;
               if (MWIsBlank(img)) {
-                  UIImage *img2 = [self renderWindow:tw rect:r mode:1];
+                  UIImage *img2 = [self renderWindow:tw rect:r mode:1 scale:sc];
                   if (img2 && !MWIsBlank(img2)) { img = img2; m = @"renderInContext"; }
                   else { m = @"ẢNH TRỐNG/ĐEN"; blank = YES; }
               }
@@ -565,20 +595,36 @@ jobs:
               if (!MWBool(kEnabled, NO)) return;
               CGRect r = MWRegion();
               if (CGRectIsNull(r)) return;
-              UIImage *img = [self captureRegion:r];
-              if (!img) { self.capFail++; return; }
+              // Chụp độ phân giải thấp để so sánh thay đổi (rẻ), chỉ chụp nét + OCR khi trang đổi
+              UIImage *low = [self captureRegion:r scale:0.5];
+              if (!low) { self.capFail++; return; }
               if (self.captureBlank) { self.blankCount++; return; }
-              self.lastImage = img;
-              NSData *th = MWThumb(img);
-              if (th && self.prevThumb && th.length == self.prevThumb.length) {
+              self.scanCount++;
+              NSData *th = MWThumb(low);
+              BOOL changed = NO;
+              if (!self.prevThumb) {
+                  changed = YES;
+              } else if (th && th.length == self.prevThumb.length) {
                   const uint8_t *a = th.bytes, *b = self.prevThumb.bytes;
                   double sum = 0;
                   for (NSUInteger i = 0; i < th.length; i++) sum += abs((int)a[i] - (int)b[i]);
                   self.imgDiff = sum / th.length;
-                  if (self.imgDiff > 2.5) { self.lastChange = [NSDate date]; self.pendingDiff = YES; }
+                  if (self.imgDiff > 1.5) {
+                      changed = YES;
+                      self.lastChange = [NSDate date];
+                      self.pendingDiff = YES;
+                  }
               }
               self.prevThumb = th;
-              [self runOCR:img];
+              if (changed) self.needOCR = YES;
+              if (self.needOCR && !self.ocrBusy) {
+                  UIImage *hi = [self captureRegion:r scale:0];
+                  if (hi && !self.captureBlank) {
+                      self.lastImage = hi;
+                      self.needOCR = NO;
+                      [self runOCR:hi];
+                  }
+              }
           }
 
           - (void)runOCR:(UIImage *)img {
@@ -628,7 +674,7 @@ jobs:
 
           - (void)processLines:(NSArray<NSString *> *)lines {
               self.ocrBusy = NO;
-              self.scanCount++;
+              self.ocrCount++;
               self.latestLines = lines;
               if (!self.baselineDone) {
                   for (NSString *l in lines) {
@@ -712,18 +758,19 @@ jobs:
               [self enqueueFrame];
               [self.pipTimer invalidate];
               __weak MWManager *ws = self;
-              self.pipTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+              self.pipTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
                   [ws enqueueFrame];
               }];
           }
 
           - (void)startPiP {
+              self.pipWantsStop = NO;
               [self setupPiP];
               [self startPiPAttempt:0];
           }
 
           - (void)startPiPAttempt:(int)n {
-              if (!self.pipController) return;
+              if (!self.pipController || self.pipWantsStop) return;
               if (self.pipController.isPictureInPictureActive) return;
               if (self.pipController.isPictureInPicturePossible) {
                   [self.pipController startPictureInPicture];
@@ -736,7 +783,33 @@ jobs:
           }
 
           - (void)stopPiP {
+              self.pipWantsStop = YES;
+              // Không cho PiP tự bật lại khi thoát app
+              self.pipController.canStartPictureInPictureAutomaticallyFromInline = NO;
+              if (self.pipController.isPictureInPictureActive) {
+                  [self.pipController stopPictureInPicture];
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                      if (self.pipWantsStop) [self teardownPiP];
+                  });
+              } else {
+                  [self teardownPiP];
+              }
+          }
+
+          // Gỡ hẳn PiP: dừng vẽ khung hình, bỏ controller và layer, nhả audio session
+          - (void)teardownPiP {
+              [self.pipTimer invalidate];
+              self.pipTimer = nil;
               if (self.pipController.isPictureInPictureActive) [self.pipController stopPictureInPicture];
+              self.pipController.delegate = nil;
+              self.pipController = nil;
+              [self.displayLayer flushAndRemoveImage];
+              [self.displayLayer removeFromSuperlayer];
+              self.displayLayer = nil;
+              [self.pipHost removeFromSuperview];
+              self.pipHost = nil;
+              [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
+              self.pipStatus = @"đã tắt";
           }
 
           - (CVPixelBufferRef)newPixelBuffer {
@@ -895,7 +968,7 @@ jobs:
               self.pipStatus = @"đang phát";
           }
           - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)c {
-              self.pipStatus = @"đã dừng";
+              if (self.pipController) self.pipStatus = @"đã dừng";
           }
           - (void)pictureInPictureController:(AVPictureInPictureController *)c failedToStartPictureInPictureWithError:(NSError *)error {
               self.pipStatus = [NSString stringWithFormat:@"lỗi: %@", error.localizedDescription];
@@ -907,13 +980,13 @@ jobs:
           #pragma mark Settings sheet UI
 
           - (UIView *)row:(NSString *)t control:(UIView *)ctrl {
-              UILabel *l = MWLabel(t, 18, UIFontWeightRegular, MW_TEXT);
+              UILabel *l = MWLabel(t, 15, UIFontWeightRegular, MW_TEXT);
               [l setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
               [ctrl setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
               UIStackView *h = [[UIStackView alloc] initWithArrangedSubviews:@[l, ctrl]];
               h.axis = UILayoutConstraintAxisHorizontal;
               h.alignment = UIStackViewAlignmentCenter;
-              [h.heightAnchor constraintGreaterThanOrEqualToConstant:52].active = YES;
+              [h.heightAnchor constraintGreaterThanOrEqualToConstant:38].active = YES;
               return h;
           }
 
@@ -935,7 +1008,7 @@ jobs:
                   [self resetTracking];
               }
               if ([key isEqualToString:kAwake]) {
-                  gKeepAwake = MWBool(kAwake, NO);
+                  gKeepAwake = MWBool(kAwake, YES);
               }
               if ([key isEqualToString:kAutoPiP] && self.pipController) {
                   self.pipController.canStartPictureInPictureAutomaticallyFromInline = MWBool(kAutoPiP, YES);
@@ -945,7 +1018,7 @@ jobs:
           static UIView *MWCard(NSArray<UIView *> *rows) {
               UIView *card = [UIView new];
               card.backgroundColor = MWRGB(255,255,255,0.55);
-              card.layer.cornerRadius = 22;
+              card.layer.cornerRadius = 14;
               card.layer.borderWidth = 1;
               card.layer.borderColor = MWRGB(48,170,240,0.35).CGColor;
               UIStackView *s = [UIStackView new];
@@ -953,10 +1026,10 @@ jobs:
               s.translatesAutoresizingMaskIntoConstraints = NO;
               [card addSubview:s];
               [NSLayoutConstraint activateConstraints:@[
-                  [s.topAnchor constraintEqualToAnchor:card.topAnchor constant:4],
-                  [s.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-4],
-                  [s.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
-                  [s.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16]
+                  [s.topAnchor constraintEqualToAnchor:card.topAnchor constant:2],
+                  [s.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-2],
+                  [s.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+                  [s.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12]
               ]];
               for (NSUInteger i = 0; i < rows.count; i++) {
                   [s addArrangedSubview:rows[i]];
@@ -973,9 +1046,9 @@ jobs:
           static UILabel *MWSection(NSString *t) {
               UILabel *l = [UILabel new];
               l.attributedText = [[NSAttributedString alloc] initWithString:t attributes:@{
-                  NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightBold],
+                  NSFontAttributeName: [UIFont systemFontOfSize:11 weight:UIFontWeightBold],
                   NSForegroundColorAttributeName: MW_PURPLE,
-                  NSKernAttributeName: @2.5
+                  NSKernAttributeName: @2
               }];
               return l;
           }
@@ -983,13 +1056,22 @@ jobs:
           - (UIButton *)button:(NSString *)t filled:(BOOL)f action:(void (^)(void))a {
               UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
               [b setTitle:t forState:UIControlStateNormal];
-              b.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
-              b.layer.cornerRadius = 14;
+              b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+              b.layer.cornerRadius = 10;
               b.backgroundColor = f ? MW_PURPLE : MWRGB(48,170,240,0.18);
               [b setTitleColor:(f ? UIColor.whiteColor : MW_DEEP) forState:UIControlStateNormal];
               [b addAction:[UIAction actionWithHandler:^(UIAction *x) { a(); }] forControlEvents:UIControlEventTouchUpInside];
-              [b.heightAnchor constraintEqualToConstant:46].active = YES;
+              [b.heightAnchor constraintEqualToConstant:34].active = YES;
+              MWPressFX(b);
               return b;
+          }
+
+          - (UIStackView *)pair:(UIView *)a with:(UIView *)b {
+              UIStackView *r = [[UIStackView alloc] initWithArrangedSubviews:@[a, b]];
+              r.axis = UILayoutConstraintAxisHorizontal;
+              r.spacing = 6;
+              r.distribution = UIStackViewDistributionFillEqually;
+              return r;
           }
 
           - (void)toggleSheet {
@@ -1006,9 +1088,9 @@ jobs:
               [self.dim addTarget:self action:@selector(hideSheet) forControlEvents:UIControlEventTouchUpInside];
               [root insertSubview:self.dim belowSubview:self.floatBtn];
 
-              CGFloat h = MIN(sz.height * 0.78, 640);
+              CGFloat h = MIN(sz.height * 0.58, 440);
               self.sheet = [[UIView alloc] initWithFrame:CGRectMake(0, sz.height, sz.width, h)];
-              self.sheet.layer.cornerRadius = 28;
+              self.sheet.layer.cornerRadius = 22;
               self.sheet.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
               self.sheet.layer.masksToBounds = YES;
               UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialLight]];
@@ -1020,16 +1102,16 @@ jobs:
               tint.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
               [self.sheet addSubview:tint];
 
-              UIView *grab = [[UIView alloc] initWithFrame:CGRectMake(sz.width / 2 - 28, 10, 56, 6)];
+              UIView *grab = [[UIView alloc] initWithFrame:CGRectMake(sz.width / 2 - 20, 8, 40, 4)];
               grab.backgroundColor = MWRGB(48,170,240,0.5);
-              grab.layer.cornerRadius = 3;
+              grab.layer.cornerRadius = 2;
               [self.sheet addSubview:grab];
 
               UIScrollView *sv = [UIScrollView new];
               sv.translatesAutoresizingMaskIntoConstraints = NO;
               [self.sheet addSubview:sv];
               [NSLayoutConstraint activateConstraints:@[
-                  [sv.topAnchor constraintEqualToAnchor:self.sheet.topAnchor constant:28],
+                  [sv.topAnchor constraintEqualToAnchor:self.sheet.topAnchor constant:18],
                   [sv.leadingAnchor constraintEqualToAnchor:self.sheet.leadingAnchor],
                   [sv.trailingAnchor constraintEqualToAnchor:self.sheet.trailingAnchor],
                   [sv.bottomAnchor constraintEqualToAnchor:self.sheet.bottomAnchor]
@@ -1037,15 +1119,15 @@ jobs:
 
               UIStackView *st = [UIStackView new];
               st.axis = UILayoutConstraintAxisVertical;
-              st.spacing = 12;
+              st.spacing = 6;
               st.translatesAutoresizingMaskIntoConstraints = NO;
               [sv addSubview:st];
               [NSLayoutConstraint activateConstraints:@[
-                  [st.topAnchor constraintEqualToAnchor:sv.contentLayoutGuide.topAnchor constant:8],
-                  [st.bottomAnchor constraintEqualToAnchor:sv.contentLayoutGuide.bottomAnchor constant:-40],
-                  [st.leadingAnchor constraintEqualToAnchor:sv.contentLayoutGuide.leadingAnchor constant:16],
-                  [st.trailingAnchor constraintEqualToAnchor:sv.contentLayoutGuide.trailingAnchor constant:-16],
-                  [st.widthAnchor constraintEqualToAnchor:sv.frameLayoutGuide.widthAnchor constant:-32]
+                  [st.topAnchor constraintEqualToAnchor:sv.contentLayoutGuide.topAnchor constant:6],
+                  [st.bottomAnchor constraintEqualToAnchor:sv.contentLayoutGuide.bottomAnchor constant:-20],
+                  [st.leadingAnchor constraintEqualToAnchor:sv.contentLayoutGuide.leadingAnchor constant:12],
+                  [st.trailingAnchor constraintEqualToAnchor:sv.contentLayoutGuide.trailingAnchor constant:-12],
+                  [st.widthAnchor constraintEqualToAnchor:sv.frameLayoutGuide.widthAnchor constant:-24]
               ]];
 
               [st addArrangedSubview:MWSection(@"FEATURES")];
@@ -1054,18 +1136,18 @@ jobs:
                   [self switchRow:@"Rung khi có tin mới" key:kHaptic def:YES],
                   [self switchRow:@"Âm báo khi có tin mới" key:kSound def:NO],
                   [self switchRow:@"Tự bật PiP khi thoát app" key:kAutoPiP def:YES],
-                  [self switchRow:@"Giữ app thức khi thoát (thử nghiệm)" key:kAwake def:NO]
+                  [self switchRow:@"Giữ app thức khi thoát" key:kAwake def:YES]
               ])];
 
               [st addArrangedSubview:MWSection(@"THEO DÕI")];
-              UILabel *tl = MWLabel(@"Chu kỳ quét", 18, UIFontWeightRegular, MW_TEXT);
-              self.intervalValue = MWLabel([NSString stringWithFormat:@"%.1fs", MWDouble(kInterval, 1.5)], 18, UIFontWeightSemibold, MW_PURPLE);
+              UILabel *tl = MWLabel(@"Chu kỳ quét", 15, UIFontWeightRegular, MW_TEXT);
+              self.intervalValue = MWLabel([NSString stringWithFormat:@"%.1fs", MWDouble(kInterval, 2.0)], 15, UIFontWeightSemibold, MW_PURPLE);
               UIStackView *top = [[UIStackView alloc] initWithArrangedSubviews:@[tl, self.intervalValue]];
               top.axis = UILayoutConstraintAxisHorizontal;
               UISlider *sl = [UISlider new];
               sl.minimumValue = 0.5;
               sl.maximumValue = 5.0;
-              sl.value = (float)MWDouble(kInterval, 1.5);
+              sl.value = (float)MWDouble(kInterval, 2.0);
               sl.minimumTrackTintColor = MW_PURPLE;
               __weak MWManager *ws = self;
               __weak UISlider *wsl = sl;
@@ -1079,28 +1161,31 @@ jobs:
               }] forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
               UIStackView *sr = [[UIStackView alloc] initWithArrangedSubviews:@[top, sl]];
               sr.axis = UILayoutConstraintAxisVertical;
-              sr.spacing = 10;
+              sr.spacing = 2;
               sr.layoutMarginsRelativeArrangement = YES;
-              sr.layoutMargins = UIEdgeInsetsMake(12, 0, 12, 0);
+              sr.layoutMargins = UIEdgeInsetsMake(8, 0, 8, 0);
               [st addArrangedSubview:MWCard(@[sr])];
 
-              [st addArrangedSubview:[self button:@"Chọn vùng chat" filled:YES action:^{ [ws beginSelection]; }]];
-              [st addArrangedSubview:[self button:@"Chọn toàn màn hình (nhanh)" filled:YES action:^{
+              UIButton *bSel = [self button:@"Chọn vùng chat" filled:YES action:^{ [ws beginSelection]; }];
+              UIButton *bFull = [self button:@"Toàn màn hình" filled:YES action:^{
                   MWSetRegion(CGRectMake(0, 0, 1, 1));
                   [ws resetTracking];
                   [ws refreshStatus];
-              }]];
-              [st addArrangedSubview:[self button:@"Mở Cửa Sổ Nổi (PiP)" filled:YES action:^{ [ws startPiP]; }]];
-              [st addArrangedSubview:[self button:@"Tắt PiP" filled:NO action:^{ [ws stopPiP]; }]];
-              [st addArrangedSubview:[self button:@"Đặt lại bộ đếm tin mới" filled:NO action:^{ [ws resetTracking]; }]];
+              }];
+              UIButton *bPip = [self button:@"Mở PiP" filled:YES action:^{ [ws startPiP]; }];
+              UIButton *bOff = [self button:@"Tắt PiP" filled:NO action:^{ [ws stopPiP]; }];
+              UIButton *bRst = [self button:@"Đặt lại bộ đếm" filled:NO action:^{ [ws resetTracking]; }];
+              [st addArrangedSubview:[self pair:bSel with:bFull]];
+              [st addArrangedSubview:[self pair:bPip with:bOff]];
+              [st addArrangedSubview:bRst];
 
               [st addArrangedSubview:MWSection(@"TRẠNG THÁI")];
-              self.statusLabel = MWLabel(@"", 14, UIFontWeightRegular, MW_TEXT);
+              self.statusLabel = MWLabel(@"", 12, UIFontWeightRegular, MW_TEXT);
               self.statusLabel.numberOfLines = 0;
               UIStackView *stRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.statusLabel]];
               stRow.axis = UILayoutConstraintAxisVertical;
               stRow.layoutMarginsRelativeArrangement = YES;
-              stRow.layoutMargins = UIEdgeInsetsMake(12, 0, 12, 0);
+              stRow.layoutMargins = UIEdgeInsetsMake(8, 0, 8, 0);
               [st addArrangedSubview:MWCard(@[stRow])];
 
               [root insertSubview:self.sheet belowSubview:self.floatBtn];
@@ -1147,10 +1232,10 @@ jobs:
               CGRect r = MWRegion();
               NSString *reg = CGRectIsNull(r) ? @"chưa chọn" : [NSString stringWithFormat:@"đã chọn (%.0f%%, %.0f%%, %.0f%%, %.0f%%)", r.origin.x * 100, r.origin.y * 100, r.size.width * 100, r.size.height * 100];
               self.statusLabel.text = [NSString stringWithFormat:
-                  @"v1.4 • Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld • Tin mới: %ld\nDòng chữ đọc được: %lu\nOCR: %@\nChụp ảnh: %@\nẢnh đổi: %.1f (lần cuối: %@)\nLỗi chụp: %ld • Ảnh trống: %ld\nNền: ok=%ld trống=%ld • app=%ld\nCửa sổ: %@\nHook: appBg=%d appRes=%d sceneBg=%d sceneRes=%d\nPiP: %@",
+                  @"v1.6 • Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld (OCR %ld) • Tin mới: %ld\nDòng chữ đọc được: %lu\nOCR: %@\nChụp ảnh: %@\nẢnh đổi: %.1f (lần cuối: %@)\nLỗi chụp: %ld • Ảnh trống: %ld\nNền: ok=%ld trống=%ld • app=%ld\nCửa sổ: %@\nHook: appBg=%d appRes=%d sceneBg=%d sceneRes=%d\nPiP: %@",
                   MWBool(kEnabled, NO) ? @"đang chạy" : @"tắt",
                   reg,
-                  (long)self.scanCount, (long)self.newCount,
+                  (long)self.scanCount, (long)self.ocrCount, (long)self.newCount,
                   (unsigned long)self.latestLines.count,
                   self.ocrInfo,
                   self.captureInfo,
@@ -1235,3 +1320,4 @@ jobs:
           git commit -m "build MuseWatch.dylib" || echo "nothing to commit"
           git pull --rebase || true
           git push
+
