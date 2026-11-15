@@ -22,6 +22,7 @@ jobs:
           #import <CoreVideo/CoreVideo.h>
           #import <Vision/Vision.h>
           #import <AudioToolbox/AudioToolbox.h>
+          #import <objc/runtime.h>
 
           #define MWRGB(r,g,b,a) [UIColor colorWithRed:(r)/255.0 green:(g)/255.0 blue:(b)/255.0 alpha:(a)]
           #define MW_PURPLE MWRGB(48,170,240,1)
@@ -34,6 +35,31 @@ jobs:
           static NSString *const kAutoPiP  = @"MW_autopip";
           static NSString *const kInterval = @"MW_interval";
           static NSString *const kRegion   = @"MW_region";
+          static NSString *const kAwake    = @"MW_awake";
+
+          static BOOL gKeepAwake = NO;
+          static IMP gOrigAppState = NULL;
+          static IMP gOrigPost = NULL;
+          static UIApplicationState MWAppState(id self, SEL _cmd) {
+              if (gKeepAwake) return UIApplicationStateActive;
+              return ((UIApplicationState (*)(id, SEL))gOrigAppState)(self, _cmd);
+          }
+          static void MWPost(id self, SEL _cmd, NSNotificationName name, id obj, NSDictionary *ui) {
+              if (gKeepAwake && ([name isEqualToString:UIApplicationDidEnterBackgroundNotification] ||
+                                 [name isEqualToString:UIApplicationWillResignActiveNotification])) {
+                  return;
+              }
+              ((void (*)(id, SEL, NSNotificationName, id, NSDictionary *))gOrigPost)(self, _cmd, name, obj, ui);
+          }
+          static void MWInstallAwakeHooks(void) {
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{
+                  Method m1 = class_getInstanceMethod(UIApplication.class, @selector(applicationState));
+                  if (m1) gOrigAppState = method_setImplementation(m1, (IMP)MWAppState);
+                  Method m2 = class_getInstanceMethod(NSNotificationCenter.class, @selector(postNotificationName:object:userInfo:));
+                  if (m2) gOrigPost = method_setImplementation(m2, (IMP)MWPost);
+              });
+          }
 
           static BOOL MWBool(NSString *k, BOOL d) {
               id v = [[NSUserDefaults standardUserDefaults] objectForKey:k];
@@ -279,6 +305,10 @@ jobs:
           @property (nonatomic) double imgDiff;
           @property (nonatomic, strong) NSDate *lastChange;
           @property (nonatomic) BOOL pendingDiff;
+          @property (nonatomic, weak) UIWindow *lastTarget;
+          @property (nonatomic) BOOL captureBlank;
+          @property (nonatomic) NSInteger capFail;
+          @property (nonatomic) NSInteger blankCount;
           @end
 
           @implementation MWManager
@@ -346,6 +376,8 @@ jobs:
               [vc.view addSubview:self.floatBtn];
 
               self.startTime = [NSDate date];
+              gKeepAwake = MWBool(kAwake, NO);
+              MWInstallAwakeHooks();
               [self restartScanTimer];
               NSLog(@"[MuseWatch] ready");
           }
@@ -381,14 +413,17 @@ jobs:
           #pragma mark Capture + OCR
 
           - (UIWindow *)targetWindow {
-              UIWindowScene *scene = self.window.windowScene;
               UIWindow *best = nil;
-              for (UIWindow *w in scene.windows) {
-                  if (w == self.window || w.hidden) continue;
-                  if (w.windowLevel > UIWindowLevelNormal) continue;
-                  if (!best || w.isKeyWindow) best = w;
+              for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+                  if (![sc isKindOfClass:UIWindowScene.class]) continue;
+                  for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                      if (w == self.window) continue;
+                      if (w.windowLevel > UIWindowLevelNormal) continue;
+                      if (!best || (w.isKeyWindow && !best.isKeyWindow) || (best.hidden && !w.hidden)) best = w;
+                  }
               }
-              return best;
+              if (best) self.lastTarget = best;
+              return best ?: self.lastTarget;
           }
 
           - (UIImage *)renderWindow:(UIWindow *)tw rect:(CGRect)r mode:(int)mode {
@@ -416,12 +451,14 @@ jobs:
               if (CGRectIsNull(r) || r.size.width < 20 || r.size.height < 20) { self.captureInfo = @"vùng chọn không hợp lệ"; return nil; }
               UIImage *img = [self renderWindow:tw rect:r mode:0];
               NSString *m = @"drawViewHierarchy";
+              BOOL blank = NO;
               if (MWIsBlank(img)) {
                   UIImage *img2 = [self renderWindow:tw rect:r mode:1];
                   if (img2 && !MWIsBlank(img2)) { img = img2; m = @"renderInContext"; }
-                  else { m = @"ẢNH TRỐNG/ĐEN (cả 2 cách đều không chụp được)"; }
+                  else { m = @"ẢNH TRỐNG/ĐEN"; blank = YES; }
               }
-              self.captureInfo = m;
+              self.captureBlank = blank;
+              self.captureInfo = [NSString stringWithFormat:@"%@ [scene=%ld hidden=%d]", m, (long)tw.windowScene.activationState, (int)tw.hidden];
               return img;
           }
 
@@ -430,7 +467,8 @@ jobs:
               CGRect r = MWRegion();
               if (CGRectIsNull(r)) return;
               UIImage *img = [self captureRegion:r];
-              if (!img) return;
+              if (!img) { self.capFail++; return; }
+              if (self.captureBlank) { self.blankCount++; return; }
               self.lastImage = img;
               NSData *th = MWThumb(img);
               if (th && self.prevThumb && th.length == self.prevThumb.length) {
@@ -452,7 +490,7 @@ jobs:
               CGImageRetain(cg);
               NSInteger cached = self.ocrMode;
               dispatch_async(self.ocrQueue, ^{
-                  NSArray *order = (cached >= 0) ? @[@(cached)] : @[@0, @1, @2, @3, @4];
+                  NSArray *order = (cached >= 0) ? @[@(cached)] : @[@2, @0, @1, @3, @4];
                   NSArray<NSString *> *best = @[];
                   NSInteger okMode = -1;
                   NSMutableArray *infos = [NSMutableArray array];
@@ -780,6 +818,9 @@ jobs:
               if ([key isEqualToString:kEnabled]) {
                   [self resetTracking];
               }
+              if ([key isEqualToString:kAwake]) {
+                  gKeepAwake = MWBool(kAwake, NO);
+              }
               if ([key isEqualToString:kAutoPiP] && self.pipController) {
                   self.pipController.canStartPictureInPictureAutomaticallyFromInline = MWBool(kAutoPiP, YES);
               }
@@ -896,7 +937,8 @@ jobs:
                   [self switchRow:@"Bật theo dõi" key:kEnabled def:NO],
                   [self switchRow:@"Rung khi có tin mới" key:kHaptic def:YES],
                   [self switchRow:@"Âm báo khi có tin mới" key:kSound def:NO],
-                  [self switchRow:@"Tự bật PiP khi thoát app" key:kAutoPiP def:YES]
+                  [self switchRow:@"Tự bật PiP khi thoát app" key:kAutoPiP def:YES],
+                  [self switchRow:@"Giữ app thức khi thoát (thử nghiệm)" key:kAwake def:NO]
               ])];
 
               [st addArrangedSubview:MWSection(@"THEO DÕI")];
@@ -973,7 +1015,7 @@ jobs:
               CGRect r = MWRegion();
               NSString *reg = CGRectIsNull(r) ? @"chưa chọn" : [NSString stringWithFormat:@"đã chọn (%.0f%%, %.0f%%, %.0f%%, %.0f%%)", r.origin.x * 100, r.origin.y * 100, r.size.width * 100, r.size.height * 100];
               self.statusLabel.text = [NSString stringWithFormat:
-                  @"v1.1 • Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld • Tin mới: %ld\nDòng chữ đọc được: %lu\nOCR: %@\nChụp ảnh: %@\nẢnh đổi: %.1f (lần cuối: %@)\nPiP: %@",
+                  @"v1.2 • Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld • Tin mới: %ld\nDòng chữ đọc được: %lu\nOCR: %@\nChụp ảnh: %@\nẢnh đổi: %.1f (lần cuối: %@)\nLỗi chụp: %ld • Ảnh trống: %ld\nPiP: %@",
                   MWBool(kEnabled, NO) ? @"đang chạy" : @"tắt",
                   reg,
                   (long)self.scanCount, (long)self.newCount,
@@ -982,6 +1024,7 @@ jobs:
                   self.captureInfo,
                   self.imgDiff,
                   self.lastChange ? [NSString stringWithFormat:@"%.0f giây trước", [[NSDate date] timeIntervalSinceDate:self.lastChange]] : @"chưa có",
+                  (long)self.capFail, (long)self.blankCount,
                   self.pipStatus];
           }
 
