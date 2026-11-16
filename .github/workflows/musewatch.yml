@@ -432,6 +432,7 @@ jobs:
           @property (nonatomic) NSInteger ocrCount;
           @property (nonatomic) BOOL needOCR;
           @property (nonatomic) BOOL pipWantsStop;
+          @property (nonatomic, weak) UISwitch *enabledSwitch;
           @end
 
           @implementation MWManager
@@ -500,6 +501,7 @@ jobs:
               [vc.view addSubview:self.floatBtn];
 
               self.startTime = [NSDate date];
+              MWSetObj(kEnabled, @NO);
               gKeepAwake = MWBool(kAwake, YES);
               MWInstallAwakeHooks();
               MWInstallDelegateHooks();
@@ -753,9 +755,9 @@ jobs:
               self.pipController = [[AVPictureInPictureController alloc] initWithContentSource:src];
               self.pipController.delegate = self;
               self.pipController.canStartPictureInPictureAutomaticallyFromInline = MWBool(kAutoPiP, YES);
-              self.pipStatus = @"sẵn sàng";
+              self.pipStatus = @"đang chờ sẵn sàng";
 
-              [self enqueueFrame];
+              for (int i = 0; i < 3; i++) [self enqueueFrame];
               [self.pipTimer invalidate];
               __weak MWManager *ws = self;
               self.pipTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
@@ -776,13 +778,17 @@ jobs:
                   [self.pipController startPictureInPicture];
                   return;
               }
-              if (n >= 8) { self.pipStatus = @"PiP chưa sẵn sàng, bấm lại sau"; return; }
-              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+              if (n >= 30) { self.pipStatus = @"PiP chưa sẵn sàng, bấm lại sau"; return; }
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                   [self startPiPAttempt:n + 1];
               });
           }
 
           - (void)stopPiP {
+              // Tắt luôn theo dõi để không còn quét/báo tin khi đổi sang đoạn chat khác
+              MWSetObj(kEnabled, @NO);
+              [self settingChanged:kEnabled];
+              [self.enabledSwitch setOn:NO animated:YES];
               self.pipWantsStop = YES;
               // Không cho PiP tự bật lại khi thoát app
               self.pipController.canStartPictureInPictureAutomaticallyFromInline = NO;
@@ -994,6 +1000,7 @@ jobs:
               UISwitch *sw = [UISwitch new];
               sw.onTintColor = MW_PURPLE;
               sw.on = MWBool(key, d);
+              if ([key isEqualToString:kEnabled]) self.enabledSwitch = sw;
               __weak UISwitch *wsw = sw;
               __weak MWManager *ws = self;
               [sw addAction:[UIAction actionWithHandler:^(UIAction *a) {
@@ -1232,7 +1239,7 @@ jobs:
               CGRect r = MWRegion();
               NSString *reg = CGRectIsNull(r) ? @"chưa chọn" : [NSString stringWithFormat:@"đã chọn (%.0f%%, %.0f%%, %.0f%%, %.0f%%)", r.origin.x * 100, r.origin.y * 100, r.size.width * 100, r.size.height * 100];
               self.statusLabel.text = [NSString stringWithFormat:
-                  @"v1.6 • Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld (OCR %ld) • Tin mới: %ld\nDòng chữ đọc được: %lu\nOCR: %@\nChụp ảnh: %@\nẢnh đổi: %.1f (lần cuối: %@)\nLỗi chụp: %ld • Ảnh trống: %ld\nNền: ok=%ld trống=%ld • app=%ld\nCửa sổ: %@\nHook: appBg=%d appRes=%d sceneBg=%d sceneRes=%d\nPiP: %@",
+                  @"v1.7 • Theo dõi: %@\nVùng chat: %@\nSố lần quét: %ld (OCR %ld) • Tin mới: %ld\nDòng chữ đọc được: %lu\nOCR: %@\nChụp ảnh: %@\nẢnh đổi: %.1f (lần cuối: %@)\nLỗi chụp: %ld • Ảnh trống: %ld\nNền: ok=%ld trống=%ld • app=%ld\nCửa sổ: %@\nHook: appBg=%d appRes=%d sceneBg=%d sceneRes=%d\nPiP: %@",
                   MWBool(kEnabled, NO) ? @"đang chạy" : @"tắt",
                   reg,
                   (long)self.scanCount, (long)self.ocrCount, (long)self.newCount,
@@ -1320,4 +1327,3 @@ jobs:
           git commit -m "build MuseWatch.dylib" || echo "nothing to commit"
           git pull --rebase || true
           git push
-
